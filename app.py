@@ -29,7 +29,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 COVER_DIR.mkdir(exist_ok=True)
 
-TOTAL_STEPS = 5
+TOTAL_STEPS = 6
 
 STEP_LABELS = {
     1: "Checking tools...",
@@ -37,6 +37,7 @@ STEP_LABELS = {
     3: "Registering Adobe device...",
     4: "Downloading EPUB...",
     5: "Removing DRM...",
+    6: "Verifying links...",
 }
 
 # Track active conversions: job_id -> {steps: [...], status, error}
@@ -168,7 +169,13 @@ def run_conversion_job(job_id, acsm_path, output_dir):
                 job["done_message"] = message
             else:
                 step_num = int(step)
-                job["steps"].append({"step": step_num, "message": message})
+                # Flag whether this step carried a link warning
+                is_warning = (step_num == 6 and "broken" in message.lower())
+                job["steps"].append({
+                    "step": step_num,
+                    "message": message,
+                    "warning": is_warning,
+                })
                 next_step = step_num + 1
                 if next_step <= TOTAL_STEPS:
                     job["current_step"] = next_step

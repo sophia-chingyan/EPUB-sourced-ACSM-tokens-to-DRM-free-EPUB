@@ -16,11 +16,14 @@ Usage:
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlparse
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIBGOUROU_DIR = SCRIPT_DIR / "libgourou"
@@ -227,6 +230,349 @@ def remove_drm(input_path, output_path):
     print(f"[OK] DRM removed: {output_path.name}")
 
 
+# ─── Link Verification ────────────────────────────────────────────────────
+
+
+# HTML/XHTML attributes that carry links
+_LINK_ATTRS = {
+    # element tag (case-insensitive) -> list of attribute names
+    "a":          ["href"],
+    "area":       ["href"],
+    "link":       ["href"],
+    "script":     ["src"],
+    "img":        ["src", "srcset"],
+    "image":      ["href", "{http://www.w3.org/1999/xlink}href"],   # SVG <image>
+    "use":        ["href", "{http://www.w3.org/1999/xlink}href"],   # SVG <use>
+    "video":      ["src", "poster"],
+    "audio":      ["src"],
+    "source":     ["src", "srcset"],
+    "track":      ["src"],
+    "iframe":     ["src"],
+    "object":     ["data"],
+    "embed":      ["src"],
+    "blockquote": ["cite"],
+    "q":          ["cite"],
+    "ins":        ["cite"],
+    "del":        ["cite"],
+}
+
+# CSS url(...) pattern
+_CSS_URL_RE = re.compile(r"""url\(\s*['"]?([^'"\)\s]+)['"]?\s*\)""", re.IGNORECASE)
+
+
+def _resolve_epub_path(base_zip_path: str, href: str) -> str | None:
+    """
+    Resolve a relative href from a file inside the EPUB zip to a canonical
+    zip-entry path. Returns None for external or fragment-only URLs.
+    """
+    parsed = urlparse(href)
+    # External URLs (http/https/ftp/mailto …) and data URIs → skip
+    if parsed.scheme and parsed.scheme not in ("", "file"):
+        return None
+    # Pure fragment anchor (#id) → no separate file needed
+    if not parsed.path:
+        return None
+
+    raw_path = unquote(parsed.path)
+    base_dir = str(PurePosixPath(base_zip_path).parent)
+    if base_dir == ".":
+        resolved = raw_path
+    else:
+        resolved = str(PurePosixPath(base_dir) / raw_path)
+
+    # Normalize away any ../ segments
+    parts = []
+    for part in resolved.split("/"):
+        if part == "..":
+            if parts:
+                parts.pop()
+        elif part and part != ".":
+            parts.append(part)
+    return "/".join(parts)
+
+
+def _collect_links_from_html(zip_path: str, text: str) -> list[str]:
+    """
+    Extract all href/src targets from an HTML/XHTML file's text content.
+    Returns a list of raw href strings (not yet resolved).
+    """
+    links: list[str] = []
+
+    # --- XML/HTML attribute scanning ---
+    try:
+        root = ET.fromstring(text.encode("utf-8", errors="replace"))
+        for elem in root.iter():
+            local_tag = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+            for attr in _LINK_ATTRS.get(local_tag, []):
+                val = elem.get(attr, "").strip()
+                if val:
+                    # srcset can be "url1 1x, url2 2x"
+                    if attr == "srcset":
+                        for part in val.split(","):
+                            candidate = part.strip().split()[0]
+                            if candidate:
+                                links.append(candidate)
+                    else:
+                        links.append(val)
+    except ET.ParseError:
+        # Fallback: regex scanning for malformed XML/HTML
+        for attr in ("href", "src", "data", "poster", "srcset", "cite"):
+            for m in re.finditer(rf"""{attr}\s*=\s*['"]([^'"]+)['"]""", text, re.IGNORECASE):
+                links.append(m.group(1).strip())
+
+    # --- Inline style / <style> blocks ---
+    for m in _CSS_URL_RE.finditer(text):
+        links.append(m.group(1).strip())
+
+    return links
+
+
+def _collect_links_from_css(text: str) -> list[str]:
+    """Extract url(...) references from a CSS file."""
+    return [m.group(1).strip() for m in _CSS_URL_RE.finditer(text)]
+
+
+def _collect_links_from_ncx(text: str) -> list[str]:
+    """Extract navPoint content src attributes from an NCX file."""
+    links: list[str] = []
+    try:
+        root = ET.fromstring(text.encode("utf-8", errors="replace"))
+        for elem in root.iter():
+            local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+            if local == "content":
+                src = elem.get("src", "").strip()
+                if src:
+                    links.append(src)
+    except ET.ParseError:
+        for m in re.finditer(r"""src\s*=\s*['"]([^'"]+)['"]""", text, re.IGNORECASE):
+            links.append(m.group(1).strip())
+    return links
+
+
+def _collect_links_from_nav(text: str) -> list[str]:
+    """Extract href values from an EPUB3 NAV document."""
+    links: list[str] = []
+    try:
+        root = ET.fromstring(text.encode("utf-8", errors="replace"))
+        for elem in root.iter():
+            local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+            if local == "a":
+                href = (elem.get("href") or "").strip()
+                if href:
+                    links.append(href)
+    except ET.ParseError:
+        for m in re.finditer(r"""href\s*=\s*['"]([^'"]+)['"]""", text, re.IGNORECASE):
+            links.append(m.group(1).strip())
+    return links
+
+
+class LinkCheckResult:
+    """Holds the outcome of an EPUB link integrity audit."""
+
+    def __init__(self):
+        self.total_links: int = 0
+        self.external_links: int = 0
+        self.fragment_links: int = 0
+        self.internal_ok: int = 0
+        self.broken: list[tuple[str, str, str]] = []   # (source_file, href, resolved)
+        self.encrypted_remaining: list[str] = []
+        self.warnings: list[str] = []
+
+    @property
+    def has_errors(self) -> bool:
+        return bool(self.broken) or bool(self.encrypted_remaining)
+
+    def summary(self) -> str:
+        lines = [
+            f"Links audited  : {self.total_links}",
+            f"  External URLs : {self.external_links}",
+            f"  Fragment-only : {self.fragment_links}",
+            f"  Internal OK   : {self.internal_ok}",
+            f"  Broken        : {len(self.broken)}",
+        ]
+        if self.encrypted_remaining:
+            lines.append(f"  Still encrypted: {len(self.encrypted_remaining)} file(s)")
+        if self.broken:
+            lines.append("Broken links:")
+            for src, href, resolved in self.broken[:20]:
+                lines.append(f"  [{src}] → {href!r}  (resolved: {resolved!r})")
+            if len(self.broken) > 20:
+                lines.append(f"  … and {len(self.broken) - 20} more.")
+        if self.warnings:
+            lines.append("Warnings:")
+            for w in self.warnings:
+                lines.append(f"  {w}")
+        return "\n".join(lines)
+
+
+def verify_epub_links(epub_path: Path) -> LinkCheckResult:
+    """
+    Open a (DRM-free) EPUB and audit every type of internal link:
+
+    Link types checked
+    ──────────────────
+    1. HTML/XHTML  : <a href>, <img src>, <link href>, <script src>,
+                     <video src/poster>, <audio src>, <source src/srcset>,
+                     <track src>, <iframe src>, <object data>, <embed src>,
+                     <blockquote cite>, <q cite>, SVG <image href>,
+                     SVG <use href>, inline style url()
+    2. CSS files   : url(…) references (fonts, images, backgrounds)
+    3. NCX (EPUB2) : navPoint/content[@src]
+    4. NAV (EPUB3) : <a href> in toc.xhtml / nav document
+    5. OPF manifest: every item href is present in the zip
+
+    External URLs (http/https/mailto/…) and pure fragment anchors (#id) are
+    counted but not treated as errors — they cannot be validated offline.
+    """
+    result = LinkCheckResult()
+
+    if not epub_path.exists():
+        result.warnings.append(f"EPUB file not found: {epub_path}")
+        return result
+
+    try:
+        zf = zipfile.ZipFile(epub_path, "r")
+    except zipfile.BadZipFile as e:
+        result.warnings.append(f"Cannot open EPUB as zip: {e}")
+        return result
+
+    with zf:
+        zip_names_lower = {n.lower(): n for n in zf.namelist()}
+        zip_names_set = set(zf.namelist())
+
+        def zip_has(path: str) -> bool:
+            """Case-insensitive membership test."""
+            return path in zip_names_set or path.lower() in zip_names_lower
+
+        # ── Check for residual encryption ─────────────────────────────────
+        if "META-INF/encryption.xml" in zip_names_set:
+            try:
+                enc_xml = zf.read("META-INF/encryption.xml").decode("utf-8", errors="replace")
+                enc_root = ET.fromstring(enc_xml)
+                for elem in enc_root.iter():
+                    local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+                    if local == "cipherreference":
+                        uri = elem.get("URI", "").strip()
+                        if uri:
+                            result.encrypted_remaining.append(uri)
+            except Exception as e:
+                result.warnings.append(f"Could not parse encryption.xml: {e}")
+
+        # ── Parse OPF to find all manifest items ─────────────────────────
+        opf_path = None
+        # Try container.xml first (standard)
+        if "META-INF/container.xml" in zip_names_set:
+            try:
+                container_xml = zf.read("META-INF/container.xml").decode("utf-8", errors="replace")
+                c_root = ET.fromstring(container_xml)
+                for elem in c_root.iter():
+                    local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+                    if local == "rootfile":
+                        opf_path = elem.get("full-path", "").strip()
+                        break
+            except Exception:
+                pass
+        if not opf_path:
+            opf_path = next((n for n in zf.namelist() if n.endswith(".opf")), None)
+
+        manifest_items: dict[str, str] = {}   # id -> zip-path
+        spine_items: list[str] = []           # zip-paths in reading order
+        nav_path: str | None = None
+        ncx_path: str | None = None
+
+        if opf_path:
+            try:
+                opf_xml = zf.read(opf_path).decode("utf-8", errors="replace")
+                opf_root = ET.fromstring(opf_xml)
+                opf_dir = str(PurePosixPath(opf_path).parent)
+
+                for elem in opf_root.iter():
+                    local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
+                    if local == "item":
+                        item_id = elem.get("id", "")
+                        href = elem.get("href", "").strip()
+                        if href:
+                            resolved = _resolve_epub_path(opf_path, href) or href
+                            manifest_items[item_id] = resolved
+                            props = elem.get("properties", "")
+                            media_type = elem.get("media-type", "")
+                            if "nav" in props:
+                                nav_path = resolved
+                            if media_type == "application/x-dtbncx+xml" or href.endswith(".ncx"):
+                                ncx_path = resolved
+
+                            # OPF manifest integrity check
+                            result.total_links += 1
+                            if not zip_has(resolved):
+                                result.broken.append((opf_path, href, resolved))
+                            else:
+                                result.internal_ok += 1
+
+                    elif local == "itemref":
+                        idref = elem.get("idref", "")
+                        if idref in manifest_items:
+                            spine_items.append(manifest_items[idref])
+
+            except Exception as e:
+                result.warnings.append(f"Could not parse OPF: {e}")
+
+        # ── Scan all content files for links ──────────────────────────────
+        for zip_entry in zf.namelist():
+            lower = zip_entry.lower()
+            is_html = lower.endswith((".xhtml", ".html", ".htm", ".xml"))
+            is_css = lower.endswith(".css")
+            is_ncx = lower.endswith(".ncx") or zip_entry == ncx_path
+            is_nav = zip_entry == nav_path
+
+            if not (is_html or is_css or is_ncx or is_nav):
+                continue
+
+            try:
+                text = zf.read(zip_entry).decode("utf-8", errors="replace")
+            except Exception as e:
+                result.warnings.append(f"Cannot read {zip_entry}: {e}")
+                continue
+
+            if is_css:
+                raw_links = _collect_links_from_css(text)
+            elif is_ncx:
+                raw_links = _collect_links_from_ncx(text)
+            elif is_nav:
+                raw_links = _collect_links_from_nav(text) + _collect_links_from_html(zip_entry, text)
+            else:
+                raw_links = _collect_links_from_html(zip_entry, text)
+
+            for href in raw_links:
+                if not href:
+                    continue
+                result.total_links += 1
+
+                parsed = urlparse(href)
+                # External URL
+                if parsed.scheme and parsed.scheme not in ("", "file"):
+                    result.external_links += 1
+                    continue
+                # Pure fragment
+                if not parsed.path:
+                    result.fragment_links += 1
+                    continue
+
+                resolved = _resolve_epub_path(zip_entry, href)
+                if resolved is None:
+                    result.external_links += 1
+                    continue
+
+                if zip_has(resolved):
+                    result.internal_ok += 1
+                else:
+                    result.broken.append((zip_entry, href, resolved))
+
+    return result
+
+
+# ─── Pipeline ─────────────────────────────────────────────────────────────
+
+
 def convert_pipeline(acsm_path, output_dir):
     """Generator that yields (step, message) tuples for each conversion step.
 
@@ -239,6 +585,7 @@ def convert_pipeline(acsm_path, output_dir):
       3. Register Adobe device
       4. Download EPUB
       5. Remove DRM
+      6. Verify link integrity
     """
     acsm_path = Path(acsm_path).resolve()
     if not acsm_path.exists():
@@ -281,6 +628,37 @@ def convert_pipeline(acsm_path, output_dir):
     drm_file.unlink()
     yield (5, f"DRM removed: {epub_file.name}")
 
+    # Step 6: Verify link integrity
+    print("Verifying link integrity...")
+    link_result = verify_epub_links(epub_file)
+
+    if link_result.encrypted_remaining:
+        # DRM removal left some encrypted content — hard error
+        files = ", ".join(link_result.encrypted_remaining[:5])
+        raise RuntimeError(
+            f"DRM removal incomplete: {len(link_result.encrypted_remaining)} file(s) "
+            f"are still encrypted ({files}). The EPUB may not be readable."
+        )
+
+    if link_result.broken:
+        # Broken internal links — warn but do not fail (publisher may have
+        # shipped a broken EPUB; we should not block the user's download)
+        broken_count = len(link_result.broken)
+        sample = link_result.broken[0]
+        warning_msg = (
+            f"Link check: {link_result.internal_ok} OK, "
+            f"{broken_count} broken (e.g. [{sample[0]}]→{sample[1]!r}). "
+            f"The EPUB is usable but some links may not work."
+        )
+        yield (6, warning_msg)
+    else:
+        yield (
+            6,
+            f"Links verified: {link_result.internal_ok} internal, "
+            f"{link_result.external_links} external, "
+            f"{link_result.fragment_links} anchors — all OK.",
+        )
+
     # Done
     size_mb = epub_file.stat().st_size / (1024 * 1024) if epub_file.exists() else 0
     yield ("done", f"{epub_file.name}|{size_mb:.1f} MB")
@@ -294,7 +672,7 @@ def do_convert(acsm_file, output_dir):
                 parts = message.split("|")
                 print(f"\n=== Done! ===\nFile: {parts[0]} ({parts[1]})")
             else:
-                print(f"\n=== Step {step}/5: {message} ===")
+                print(f"\n=== Step {step}/6: {message} ===")
     except RuntimeError as e:
         print(str(e))
         sys.exit(1)
@@ -320,7 +698,17 @@ def main():
         default="output",
         help="Output directory (default: output)",
     )
+    parser.add_argument(
+        "--verify-only",
+        metavar="EPUB",
+        help="Audit link integrity of an existing EPUB file (no conversion)",
+    )
     args = parser.parse_args()
+
+    if args.verify_only:
+        result = verify_epub_links(Path(args.verify_only))
+        print(result.summary())
+        sys.exit(1 if result.has_errors else 0)
 
     if args.setup:
         do_setup()
