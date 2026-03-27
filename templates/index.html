@@ -15,12 +15,40 @@
         header.hero {
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
             color: #fff;
-            padding: 2.5rem 0;
+            padding: 2.5rem 0 0;
             margin-bottom: 2rem;
-            text-align: center;
         }
+        .hero-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 2rem 1.5rem;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+        .hero-brand { text-align: left; }
         header.hero h1 { color: #fff; margin-bottom: 0.25rem; }
         header.hero p { color: #a0b4cc; margin: 0; }
+        .hero-nav { display: flex; gap: 0.25rem; }
+        .hero-nav a {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.45rem 0.9rem;
+            border-radius: 7px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: #a0b4cc;
+            text-decoration: none;
+            transition: color 0.15s, background 0.15s;
+        }
+        .hero-nav a:hover { color: #fff; background: rgba(255,255,255,0.1); }
+        .hero-nav a.active { color: #fff; background: rgba(255,255,255,0.15); }
+        .hero-divider {
+            border: none;
+            border-top: 1px solid rgba(255,255,255,0.08);
+            margin: 0;
+        }
 
         .upload-box {
             background: #fff;
@@ -108,6 +136,22 @@
             white-space: nowrap;
         }
         .btn-dl:hover { background: var(--accent-hover); color: #fff; }
+        .library-link-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+        .library-link-row a {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--accent);
+            text-decoration: none;
+        }
+        .library-link-row a:hover { text-decoration: underline; }
 
         @keyframes spin { to { transform: rotate(360deg); } }
         .step { padding: 0.3rem 0; font-size: 0.95rem; }
@@ -196,10 +240,23 @@
 </head>
 <body>
     <header class="hero">
-        <div class="container">
-            <h1>ACSM to EPUB Converter</h1>
-            <p>Convert EPUB-sourced ACSM tokens to DRM-free EPUB</p>
+        <div class="hero-top container">
+            <div class="hero-brand">
+                <h1>ACSM to EPUB Converter</h1>
+                <p>Convert EPUB-sourced ACSM tokens to DRM-free EPUB</p>
+            </div>
+            <nav class="hero-nav">
+                <a href="/" class="active">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                    Convert
+                </a>
+                <a href="/library">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+                    Library
+                </a>
+            </nav>
         </div>
+        <hr class="hero-divider">
     </header>
 
     <main class="container">
@@ -244,13 +301,20 @@
             </div>
             <div class="done-actions">
                 <a id="btn-dl-epub" href="#" class="btn-dl-epub">⬇ Download EPUB</a>
+                <a href="/library" class="btn-another">📚 View Library</a>
                 <button class="btn-another" onclick="resetToUpload()">Convert another file</button>
             </div>
         </section>
 
         {% if books %}
         <section>
-            <h3>Previously Converted</h3>
+            <div class="library-link-row">
+                <h3 style="margin:0">Previously Converted</h3>
+                <a href="/library">
+                    Manage library
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                </a>
+            </div>
             <div class="book-grid">
                 {% for book in books %}
                 <article class="book-card">
@@ -395,7 +459,6 @@
                         const s = data.steps[i];
 
                         if (s.step === 'done') {
-                            // Mark active step as done
                             Object.values(stepDivs).forEach(d => {
                                 if (d.dataset.status === 'active') {
                                     d.dataset.status = 'done';
@@ -454,7 +517,6 @@
                                 stepsDiv.appendChild(div);
                             }
 
-                            // Populate the warning detail box
                             if (isWarning) {
                                 linkWarningText.textContent = s.message + ' ';
                             }
