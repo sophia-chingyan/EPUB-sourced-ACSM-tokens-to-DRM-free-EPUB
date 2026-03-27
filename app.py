@@ -169,7 +169,6 @@ def run_conversion_job(job_id, acsm_path, output_dir):
                 job["done_message"] = message
             else:
                 step_num = int(step)
-                # Flag whether this step carried a link warning
                 is_warning = (step_num == 6 and "broken" in message.lower())
                 job["steps"].append({
                     "step": step_num,
@@ -197,6 +196,73 @@ def index():
     resp = make_response(render_template("index.html", books=books))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
+
+
+@app.route("/library")
+@login_required
+def library():
+    books = get_books()
+    resp = make_response(render_template("library.html", books=books))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
+@app.route("/delete/<filename>", methods=["POST"])
+@login_required
+def delete_file(filename):
+    filename = Path(filename).name
+    stem = Path(filename).stem
+    deleted = []
+    errors = []
+
+    file_path = OUTPUT_DIR / filename
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            deleted.append(filename)
+        except Exception as e:
+            errors.append(str(e))
+    else:
+        errors.append(f"{filename} not found")
+
+    # Clean up associated upload and cover files
+    for d in (UPLOAD_DIR, COVER_DIR):
+        if d.exists():
+            for f in list(d.iterdir()):
+                if f.stem == stem or f.stem.startswith(stem):
+                    try:
+                        f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    if errors and not deleted:
+        return jsonify({"error": "; ".join(errors)}), 404
+    return jsonify({"deleted": deleted, "errors": errors})
+
+
+@app.route("/delete-all", methods=["POST"])
+@login_required
+def delete_all():
+    deleted = []
+    errors = []
+    if OUTPUT_DIR.exists():
+        for f in list(OUTPUT_DIR.iterdir()):
+            if f.suffix == ".epub":
+                try:
+                    stem = f.stem
+                    f.unlink()
+                    deleted.append(f.name)
+                    for d in (UPLOAD_DIR, COVER_DIR):
+                        if d.exists():
+                            for cf in list(d.iterdir()):
+                                if cf.stem == stem or cf.stem.startswith(stem):
+                                    try:
+                                        cf.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    errors.append(str(e))
+    return jsonify({"deleted": deleted, "errors": errors})
 
 
 @app.route("/upload", methods=["POST"])
