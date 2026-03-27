@@ -8,11 +8,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Clone and build libgourou
-RUN git clone --recurse-submodules https://forge.soutade.fr/soutade/libgourou.git /app/libgourou \
-    && cd /app/libgourou \
+# Clone libgourou.
+#
+# The canonical upstream is forge.soutade.fr — a self-hosted Forgejo instance
+# that can be slow or temporarily unreachable from Zeabur's build servers.
+# We use a GitHub mirror as primary and fall back to the original, so builds
+# are resilient without losing the ability to pick up upstream fixes.
+#
+RUN git clone --recurse-submodules \
+        https://github.com/BentonEdmondson/the-one-with-libgourou-and-utilities.git \
+        /app/libgourou \
+    || git clone --recurse-submodules \
+        https://forge.soutade.fr/soutade/libgourou.git \
+        /app/libgourou
+
+# Build all three utilities and verify they were produced
+RUN cd /app/libgourou \
     && make BUILD_UTILS=1 BUILD_STATIC=1 BUILD_SHARED=0 \
-    && ls -la /app/libgourou/utils/acsmdownloader
+    && ls -la /app/libgourou/utils/acsmdownloader \
+    && ls -la /app/libgourou/utils/adept_activate \
+    && ls -la /app/libgourou/utils/adept_remove
 
 # Install Python dependencies
 COPY requirements.txt .
@@ -22,11 +37,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py converter.py ./
 COPY templates/ templates/
 
-# Pre-create the data directory tree so the app works without a mounted volume
-# (e.g. local dev / first boot). On Zeabur, mount a persistent volume at /app/data.
-RUN mkdir -p /app/data/uploads /app/data/output /app/data/covers /app/data/adept
+# Persistent data directories.
+# On Zeabur: mount a Volume to /data so these survive restarts/redeploys.
+# /data/adept holds the Adobe device registration — losing it forces a
+# re-register with Adobe's servers on every cold start.
+RUN mkdir -p /data/uploads /data/output /data/covers /data/adept \
+    && ln -s /data/uploads /app/uploads \
+    && ln -s /data/output  /app/output \
+    && ln -s /data/covers  /app/covers \
+    && mkdir -p /root/.config \
+    && ln -s /data/adept   /root/.config/adept
 
 EXPOSE 8080
 
-# Shell form so $PORT is expanded at runtime — Zeabur injects PORT automatically.
+# Shell form so Zeabur's injected $PORT is expanded at runtime.
+# Falls back to 8080 for local docker run.
 CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --threads 4 --timeout 300"
