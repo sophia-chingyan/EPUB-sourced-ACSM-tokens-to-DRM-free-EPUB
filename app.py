@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Flask web interface for the ACSM to EPUB converter (EPUB sources only)."""
 
-import json
 import os
 import threading
 import time
@@ -11,7 +10,10 @@ from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, jsonify, make_response, render_template, request, send_from_directory, session, redirect, url_for
+from flask import (
+    Flask, jsonify, make_response, render_template, request,
+    send_from_directory, session, redirect, url_for,
+)
 
 from converter import convert_pipeline
 
@@ -21,13 +23,16 @@ app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = SCRIPT_DIR / "uploads"
-OUTPUT_DIR = SCRIPT_DIR / "output"
-COVER_DIR = SCRIPT_DIR / "covers"
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-COVER_DIR.mkdir(exist_ok=True)
+# All mutable data lives under DATA_DIR so a single Zeabur persistent volume
+# mounted at /app/data survives redeploys. Override with DATA_DIR env var if needed.
+DATA_DIR   = Path(os.environ.get("DATA_DIR", SCRIPT_DIR / "data"))
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "output"
+COVER_DIR  = DATA_DIR / "covers"
+
+for _d in (UPLOAD_DIR, OUTPUT_DIR, COVER_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 TOTAL_STEPS = 6
 
@@ -40,9 +45,10 @@ STEP_LABELS = {
     6: "Verifying links...",
 }
 
-# Track active conversions: job_id -> {steps: [...], status, error}
-active_jobs = {}
+active_jobs: dict = {}
 
+
+# ── Auth ──────────────────────────────────────────────────────────────────
 
 def login_required(f):
     @wraps(f)
@@ -73,7 +79,9 @@ def logout():
     return redirect(url_for("login"))
 
 
-def extract_epub_cover(epub_path):
+# ── Cover extraction ──────────────────────────────────────────────────────
+
+def extract_epub_cover(epub_path: Path):
     cover_out = COVER_DIR / f"{epub_path.stem}.jpg"
     if cover_out.exists():
         return cover_out.name
@@ -130,6 +138,8 @@ def _find_cover_by_name(zf):
     return None
 
 
+# ── Book listing ──────────────────────────────────────────────────────────
+
 def get_books():
     if not OUTPUT_DIR.exists():
         return []
@@ -146,14 +156,15 @@ def get_books():
                 "ext": "EPUB",
             })
             if not books[stem]["cover"]:
-                cover = extract_epub_cover(f)
-                if cover:
-                    books[stem]["cover"] = cover
+                cov = extract_epub_cover(f)
+                if cov:
+                    books[stem]["cover"] = cov
     return list(books.values())
 
 
-def run_conversion_job(job_id, acsm_path, output_dir):
-    """Run conversion in a background thread, updating active_jobs."""
+# ── Conversion job runner ─────────────────────────────────────────────────
+
+def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
     import traceback
     job = active_jobs[job_id]
     print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
@@ -189,6 +200,8 @@ def run_conversion_job(job_id, acsm_path, output_dir):
         job["error"] = f"Unexpected error: {e}"
 
 
+# ── Routes ────────────────────────────────────────────────────────────────
+
 @app.route("/")
 @login_required
 def index():
@@ -205,64 +218,6 @@ def library():
     resp = make_response(render_template("library.html", books=books))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
-
-
-@app.route("/delete/<filename>", methods=["POST"])
-@login_required
-def delete_file(filename):
-    filename = Path(filename).name
-    stem = Path(filename).stem
-    deleted = []
-    errors = []
-
-    file_path = OUTPUT_DIR / filename
-    if file_path.exists():
-        try:
-            file_path.unlink()
-            deleted.append(filename)
-        except Exception as e:
-            errors.append(str(e))
-    else:
-        errors.append(f"{filename} not found")
-
-    # Clean up associated upload and cover files
-    for d in (UPLOAD_DIR, COVER_DIR):
-        if d.exists():
-            for f in list(d.iterdir()):
-                if f.stem == stem or f.stem.startswith(stem):
-                    try:
-                        f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-
-    if errors and not deleted:
-        return jsonify({"error": "; ".join(errors)}), 404
-    return jsonify({"deleted": deleted, "errors": errors})
-
-
-@app.route("/delete-all", methods=["POST"])
-@login_required
-def delete_all():
-    deleted = []
-    errors = []
-    if OUTPUT_DIR.exists():
-        for f in list(OUTPUT_DIR.iterdir()):
-            if f.suffix == ".epub":
-                try:
-                    stem = f.stem
-                    f.unlink()
-                    deleted.append(f.name)
-                    for d in (UPLOAD_DIR, COVER_DIR):
-                        if d.exists():
-                            for cf in list(d.iterdir()):
-                                if cf.stem == stem or cf.stem.startswith(stem):
-                                    try:
-                                        cf.unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
-                except Exception as e:
-                    errors.append(str(e))
-    return jsonify({"deleted": deleted, "errors": errors})
 
 
 @app.route("/upload", methods=["POST"])
@@ -282,10 +237,8 @@ def upload():
 @app.route("/start-convert/<filename>", methods=["POST"])
 @login_required
 def start_convert(filename):
-    """Start conversion in background, return a job ID for polling."""
     filename = Path(filename).name
     acsm_path = UPLOAD_DIR / filename
-
     if not acsm_path.exists():
         return jsonify({"error": "File not found"}), 404
 
@@ -300,27 +253,20 @@ def start_convert(filename):
         "done_message": None,
         "start_time": time.time(),
     }
-
-    t = threading.Thread(
+    threading.Thread(
         target=run_conversion_job,
         args=(job_id, acsm_path, OUTPUT_DIR),
         daemon=True,
-    )
-    t.start()
-
+    ).start()
     return jsonify({"job_id": job_id})
 
 
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
-    """Poll endpoint: returns current conversion progress."""
     if job_id not in active_jobs:
         return jsonify({"error": "Job not found"}), 404
-
     job = active_jobs[job_id]
-    elapsed = round(time.time() - job["start_time"])
-
     return jsonify({
         "status": job["status"],
         "steps": job["steps"],
@@ -328,7 +274,7 @@ def job_status(job_id):
         "current_label": job["current_label"],
         "error": job["error"],
         "done_message": job["done_message"],
-        "elapsed": elapsed,
+        "elapsed": round(time.time() - job["start_time"]),
     })
 
 
@@ -349,14 +295,70 @@ def download(filename):
         except Exception:
             pass
         for d in (UPLOAD_DIR, COVER_DIR):
-            for f in d.iterdir():
+            if d.exists():
+                for f in d.iterdir():
+                    if f.stem == stem or f.stem.startswith(stem):
+                        try:
+                            f.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+    return resp
+
+
+@app.route("/delete/<filename>", methods=["POST"])
+@login_required
+def delete_file(filename):
+    filename = Path(filename).name
+    stem = Path(filename).stem
+    deleted, errors = [], []
+
+    file_path = OUTPUT_DIR / filename
+    if file_path.exists():
+        try:
+            file_path.unlink()
+            deleted.append(filename)
+        except Exception as e:
+            errors.append(str(e))
+    else:
+        errors.append(f"{filename} not found")
+
+    for d in (UPLOAD_DIR, COVER_DIR):
+        if d.exists():
+            for f in list(d.iterdir()):
                 if f.stem == stem or f.stem.startswith(stem):
                     try:
                         f.unlink(missing_ok=True)
                     except Exception:
                         pass
 
-    return resp
+    if errors and not deleted:
+        return jsonify({"error": "; ".join(errors)}), 404
+    return jsonify({"deleted": deleted, "errors": errors})
+
+
+@app.route("/delete-all", methods=["POST"])
+@login_required
+def delete_all():
+    deleted, errors = [], []
+    if OUTPUT_DIR.exists():
+        for f in list(OUTPUT_DIR.iterdir()):
+            if f.suffix == ".epub":
+                try:
+                    stem = f.stem
+                    f.unlink()
+                    deleted.append(f.name)
+                    for d in (UPLOAD_DIR, COVER_DIR):
+                        if d.exists():
+                            for cf in list(d.iterdir()):
+                                if cf.stem == stem or cf.stem.startswith(stem):
+                                    try:
+                                        cf.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                except Exception as e:
+                    errors.append(str(e))
+    return jsonify({"deleted": deleted, "errors": errors})
 
 
 @app.route("/cover/<filename>")
@@ -369,25 +371,25 @@ def cover(filename):
 @app.route("/debug-status")
 @login_required
 def debug_status():
-    """Debug endpoint to check server state."""
     import shutil
-    jobs_summary = {}
-    for jid, job in active_jobs.items():
-        jobs_summary[jid] = {
-            "status": job["status"],
-            "steps_count": len(job["steps"]),
-            "current_step": job["current_step"],
-            "error": job["error"],
-            "elapsed": round(time.time() - job["start_time"]),
-        }
-    upload_files = [f.name for f in UPLOAD_DIR.iterdir()] if UPLOAD_DIR.exists() else []
-    output_files = [f.name for f in OUTPUT_DIR.iterdir()] if OUTPUT_DIR.exists() else []
     return jsonify({
-        "active_jobs": jobs_summary,
-        "upload_files": upload_files,
-        "output_files": output_files,
-        "acsmdownloader_found": shutil.which("acsmdownloader") or str(Path("libgourou/utils/acsmdownloader")),
+        "data_dir": str(DATA_DIR),
+        "active_jobs": {
+            jid: {
+                "status": job["status"],
+                "steps_count": len(job["steps"]),
+                "current_step": job["current_step"],
+                "error": job["error"],
+                "elapsed": round(time.time() - job["start_time"]),
+            }
+            for jid, job in active_jobs.items()
+        },
+        "upload_files": [f.name for f in UPLOAD_DIR.iterdir()] if UPLOAD_DIR.exists() else [],
+        "output_files": [f.name for f in OUTPUT_DIR.iterdir()] if OUTPUT_DIR.exists() else [],
+        "acsmdownloader_found": shutil.which("acsmdownloader")
+            or str(SCRIPT_DIR / "libgourou" / "utils" / "acsmdownloader"),
         "libgourou_exists": (SCRIPT_DIR / "libgourou" / "utils" / "acsmdownloader").exists(),
+        "adept_registered": (DATA_DIR / "adept" / "device.xml").exists(),
     })
 
 

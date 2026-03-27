@@ -22,9 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py converter.py ./
 COPY templates/ templates/
 
-# Create data directories
-RUN mkdir -p uploads output covers
+# Pre-create the data directory tree so the app works without a mounted volume
+# (e.g. local dev / first boot). On Zeabur, mount a persistent volume at /app/data.
+RUN mkdir -p /app/data/uploads /app/data/output /app/data/covers /app/data/adept
 
 EXPOSE 8080
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:8080", "--threads", "4", "--timeout", "300"]
+# Shell form so $PORT is expanded at runtime — Zeabur injects PORT automatically.
+CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --threads 4 --timeout 300"
