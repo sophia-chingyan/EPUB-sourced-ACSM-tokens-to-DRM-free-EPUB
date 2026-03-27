@@ -8,13 +8,13 @@
 startup_timeout = 120   # seconds — first request triggers Adobe device registration
 
 # ── Persistent Volume ────────────────────────────────────────────────────────
-# IMPORTANT: Create a volume in the Zeabur dashboard and mount it at /app/data.
+# IMPORTANT: Create a volume in the Zeabur dashboard and mount it at /data.
 # This keeps uploads, converted EPUBs, cover images, AND Adobe device credentials
 # across every redeploy. Without it, the container re-registers a new Adobe device
 # on every restart, which will cause "device limit exceeded" errors over time.
 #
 # Zeabur dashboard → your service → Volumes → Add Volume
-#   Mount path: /app/data
+#   Mount path: /data
 #
 # ── Environment Variables ────────────────────────────────────────────────────
 # Set these in the Zeabur dashboard (Settings → Environment Variables):
@@ -22,5 +22,5 @@ startup_timeout = 120   # seconds — first request triggers Adobe device regist
 #   SECRET_KEY   — any long random string, e.g. output of: python3 -c "import secrets; print(secrets.token_hex(32))"
 #   APP_PASSWORD — password to protect the web UI (leave empty to disable auth)
 #
-# DATA_DIR defaults to /app/data inside the container, which matches the volume
+# DATA_DIR defaults to /data inside the container, which matches the volume
 # mount above. You do not need to set it explicitly.

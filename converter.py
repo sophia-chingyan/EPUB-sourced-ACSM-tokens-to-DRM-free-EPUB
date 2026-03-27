@@ -174,6 +174,17 @@ def detect_format(acsm_path):
                 "Only EPUB-sourced ACSM files are supported."
             )
 
+    # Also check the metadata/format element
+    fmt_elem = root.find(".//adept:metadata/adept:format", ns)
+    if fmt_elem is not None and fmt_elem.text:
+        fmt = fmt_elem.text.strip().lower()
+        if "pdf" in fmt:
+            raise RuntimeError(
+                "This ACSM file points to a PDF ebook (format: "
+                f"{fmt_elem.text.strip()}). "
+                "Only EPUB-sourced ACSM files are supported."
+            )
+
     # Treat unknown/missing src as EPUB (most common case)
     return "epub"
 
@@ -187,12 +198,41 @@ def register_device():
 
     print("Registering Adobe device (anonymous)...")
     tool = find_tool("adept_activate")
+    if not tool:
+        raise RuntimeError("adept_activate not found. Cannot register device.")
+
+    # BUG FIX: adept_activate uses -r for anonymous registration, not -a.
+    # The -a flag does not exist in libgourou's adept_activate and would
+    # cause the tool to fail silently or error out.
+    #
+    # Try -r first (standard libgourou flag for anonymous registration).
+    # Some forks accept no flags at all for anonymous mode, so fall back
+    # to calling without arguments if -r fails.
     try:
-        result = run([tool, "-a"], timeout=30)
+        result = run([tool, "-r"], timeout=30)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Device registration timed out (30s).")
+
     if result.returncode != 0:
-        raise RuntimeError(f"Device registration failed: {result.stdout}\n{result.stderr}")
+        # Fallback: try without any flags (some builds default to anonymous)
+        print("[DEBUG] adept_activate -r failed, trying without flags...", flush=True)
+        try:
+            result = run([tool], timeout=30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Device registration timed out (30s).")
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Device registration failed:\n"
+                f"stdout: {result.stdout}\nstderr: {result.stderr}"
+            )
+
+    # Verify the device file was actually created
+    if not device_file.exists():
+        raise RuntimeError(
+            "Device registration command succeeded but device.xml was not created. "
+            f"Check that ADEPT_DIR ({ADEPT_DIR}) is writable.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
 
     print("[OK] Adobe device registered.")
 
@@ -201,6 +241,8 @@ def fulfill_acsm(acsm_path, output_path):
     """Download the DRM-protected EPUB by fulfilling the ACSM token."""
     print(f"Fulfilling ACSM: {acsm_path.name}")
     tool = find_tool("acsmdownloader")
+    if not tool:
+        raise RuntimeError("acsmdownloader not found.")
     try:
         result = run([tool, "-f", str(acsm_path), "-o", str(output_path)], timeout=120)
     except subprocess.TimeoutExpired:
@@ -220,12 +262,19 @@ def remove_drm(input_path, output_path):
     """Remove DRM from the downloaded EPUB."""
     print(f"Removing DRM: {input_path.name}")
     tool = find_tool("adept_remove")
+    if not tool:
+        raise RuntimeError("adept_remove not found.")
     try:
         result = run([tool, "-f", str(input_path), "-o", str(output_path)], timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("DRM removal timed out (60s).")
     if result.returncode != 0:
         raise RuntimeError(f"DRM removal failed: {(result.stderr or result.stdout)[:300]}")
+
+    if not output_path.exists():
+        raise RuntimeError(
+            f"DRM removal command succeeded but output file not found at {output_path}."
+        )
 
     print(f"[OK] DRM removed: {output_path.name}")
 
@@ -258,6 +307,22 @@ _LINK_ATTRS = {
 
 # CSS url(...) pattern
 _CSS_URL_RE = re.compile(r"""url\(\s*['"]?([^'"\)\s]+)['"]?\s*\)""", re.IGNORECASE)
+
+# Encryption algorithms that indicate real DRM, not just font obfuscation
+_DRM_ALGORITHMS = {
+    "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
+    "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
+    "http://www.w3.org/2001/04/xmlenc#tripledes-cbc",
+    "http://www.w3.org/2001/04/xmlenc#aes128-gcm",
+    "http://www.w3.org/2001/04/xmlenc#aes256-gcm",
+}
+
+# Font obfuscation algorithms (these are NOT DRM — they are permitted by the
+# EPUB spec and do not prevent reading the book)
+_FONT_OBFUSCATION_ALGORITHMS = {
+    "http://www.idpf.org/2008/embedding",           # IDPF font obfuscation
+    "http://ns.adobe.com/pdf/enc#RC",               # Adobe font obfuscation
+}
 
 
 def _resolve_epub_path(base_zip_path: str, href: str) -> str | None:
@@ -376,6 +441,7 @@ class LinkCheckResult:
         self.internal_ok: int = 0
         self.broken: list[tuple[str, str, str]] = []   # (source_file, href, resolved)
         self.encrypted_remaining: list[str] = []
+        self.obfuscated_fonts: list[str] = []           # font obfuscation (not DRM)
         self.warnings: list[str] = []
 
     @property
@@ -392,6 +458,8 @@ class LinkCheckResult:
         ]
         if self.encrypted_remaining:
             lines.append(f"  Still encrypted: {len(self.encrypted_remaining)} file(s)")
+        if self.obfuscated_fonts:
+            lines.append(f"  Obfuscated fonts: {len(self.obfuscated_fonts)} (normal, not DRM)")
         if self.broken:
             lines.append("Broken links:")
             for src, href, resolved in self.broken[:20]:
@@ -407,7 +475,7 @@ class LinkCheckResult:
 
 def verify_epub_links(epub_path: Path) -> LinkCheckResult:
     """
-    Open a (DRM-free) EPUB and audit every type of internal link:
+    Open a (DRM-free) EPUB and audit every type of internal link.
 
     Link types checked
     ──────────────────
@@ -445,16 +513,44 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
             return path in zip_names_set or path.lower() in zip_names_lower
 
         # ── Check for residual encryption ─────────────────────────────────
+        # BUG FIX: Distinguish real DRM encryption from harmless font
+        # obfuscation. Many DRM-free EPUBs retain encryption.xml with
+        # entries for obfuscated fonts (IDPF/Adobe font mangling). These
+        # are NOT DRM and should not cause a hard error.
         if "META-INF/encryption.xml" in zip_names_set:
             try:
                 enc_xml = zf.read("META-INF/encryption.xml").decode("utf-8", errors="replace")
                 enc_root = ET.fromstring(enc_xml)
-                for elem in enc_root.iter():
-                    local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
-                    if local == "cipherreference":
-                        uri = elem.get("URI", "").strip()
-                        if uri:
-                            result.encrypted_remaining.append(uri)
+                for enc_data in enc_root.iter():
+                    local = enc_data.tag.split("}")[-1].lower() if "}" in enc_data.tag else enc_data.tag.lower()
+                    if local != "encrypteddata":
+                        continue
+
+                    # Find the algorithm used
+                    algorithm = None
+                    uri = None
+                    for child in enc_data.iter():
+                        child_local = child.tag.split("}")[-1].lower() if "}" in child.tag else child.tag.lower()
+                        if child_local == "encryptionmethod":
+                            algorithm = child.get("Algorithm", "").strip()
+                        elif child_local == "cipherreference":
+                            uri = child.get("URI", "").strip()
+
+                    if not uri:
+                        continue
+
+                    if algorithm in _FONT_OBFUSCATION_ALGORITHMS:
+                        # Font obfuscation — not DRM, perfectly normal
+                        result.obfuscated_fonts.append(uri)
+                    elif algorithm in _DRM_ALGORITHMS or algorithm is None:
+                        # Real DRM encryption or unknown algorithm — flag it
+                        result.encrypted_remaining.append(uri)
+                    else:
+                        # Unknown algorithm — warn but don't hard-fail
+                        result.warnings.append(
+                            f"Unknown encryption algorithm for {uri}: {algorithm}"
+                        )
+
             except Exception as e:
                 result.warnings.append(f"Could not parse encryption.xml: {e}")
 
@@ -625,7 +721,11 @@ def convert_pipeline(acsm_path, output_dir):
     # Step 5: Remove DRM
     epub_file = output_dir / f"{stem}.epub"
     remove_drm(drm_file, epub_file)
-    drm_file.unlink()
+    # Clean up the intermediate DRM file
+    try:
+        drm_file.unlink()
+    except Exception:
+        pass
     yield (5, f"DRM removed: {epub_file.name}")
 
     # Step 6: Verify link integrity
@@ -652,11 +752,14 @@ def convert_pipeline(acsm_path, output_dir):
         )
         yield (6, warning_msg)
     else:
+        extra = ""
+        if link_result.obfuscated_fonts:
+            extra = f", {len(link_result.obfuscated_fonts)} obfuscated fonts (normal)"
         yield (
             6,
             f"Links verified: {link_result.internal_ok} internal, "
             f"{link_result.external_links} external, "
-            f"{link_result.fragment_links} anchors — all OK.",
+            f"{link_result.fragment_links} anchors{extra} — all OK.",
         )
 
     # Done

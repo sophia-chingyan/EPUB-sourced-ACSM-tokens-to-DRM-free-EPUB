@@ -11,9 +11,8 @@ WORKDIR /app
 # Clone libgourou.
 #
 # The canonical upstream is forge.soutade.fr — a self-hosted Forgejo instance
-# that can be slow or temporarily unreachable from Zeabur's build servers.
-# We use a GitHub mirror as primary and fall back to the original, so builds
-# are resilient without losing the ability to pick up upstream fixes.
+# that can be slow or temporarily unreachable from build servers.
+# We use a GitHub mirror as primary and fall back to the original.
 #
 RUN git clone --recurse-submodules \
         https://github.com/BentonEdmondson/the-one-with-libgourou-and-utilities.git \
@@ -38,18 +37,23 @@ COPY app.py converter.py ./
 COPY templates/ templates/
 
 # Persistent data directories.
+#
+# BUG FIX: Use /data consistently everywhere. The app.py DATA_DIR defaults
+# to /data when /data exists (i.e. inside Docker), and the adept symlink
+# must also point to /data/adept. Previously the Dockerfile used /data but
+# app.py defaulted to /app/data, causing a split-brain.
+#
 # On Zeabur: mount a Volume to /data so these survive restarts/redeploys.
 # /data/adept holds the Adobe device registration — losing it forces a
 # re-register with Adobe's servers on every cold start.
 RUN mkdir -p /data/uploads /data/output /data/covers /data/adept \
-    && ln -s /data/uploads /app/uploads \
-    && ln -s /data/output  /app/output \
-    && ln -s /data/covers  /app/covers \
     && mkdir -p /root/.config \
-    && ln -s /data/adept   /root/.config/adept
+    && ln -s /data/adept /root/.config/adept
 
 EXPOSE 8080
 
 # Shell form so Zeabur's injected $PORT is expanded at runtime.
 # Falls back to 8080 for local docker run.
+# --timeout 300 is critical: device registration + ACSM download can take
+# over 30s on a cold start.
 CMD sh -c "gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --threads 4 --timeout 300"

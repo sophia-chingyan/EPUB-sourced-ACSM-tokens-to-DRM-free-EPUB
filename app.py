@@ -25,8 +25,12 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # All mutable data lives under DATA_DIR so a single Zeabur persistent volume
-# mounted at /app/data survives redeploys. Override with DATA_DIR env var if needed.
-DATA_DIR   = Path(os.environ.get("DATA_DIR", SCRIPT_DIR / "data"))
+# mounted at /data survives redeploys. Override with DATA_DIR env var if needed.
+#
+# BUG FIX: Default to /data (matching Dockerfile symlinks and volume mount)
+# when running in Docker, fall back to ./data for local development.
+_default_data = "/data" if Path("/data").exists() else str(SCRIPT_DIR / "data")
+DATA_DIR   = Path(os.environ.get("DATA_DIR", _default_data))
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "output"
 COVER_DIR  = DATA_DIR / "covers"
@@ -45,6 +49,8 @@ STEP_LABELS = {
     6: "Verifying links...",
 }
 
+# BUG FIX: Protect active_jobs with a lock for thread safety
+_jobs_lock = threading.Lock()
 active_jobs: dict = {}
 
 
@@ -166,7 +172,8 @@ def get_books():
 
 def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
     import traceback
-    job = active_jobs[job_id]
+    with _jobs_lock:
+        job = active_jobs[job_id]
     print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
     try:
         job["current_step"] = 1
@@ -198,6 +205,12 @@ def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
         print(f"[DEBUG] Job {job_id} Exception: {e}\n{traceback.format_exc()}", flush=True)
         job["status"] = "error"
         job["error"] = f"Unexpected error: {e}"
+    finally:
+        # Clean up the uploaded .acsm file after conversion (success or failure)
+        try:
+            acsm_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -243,16 +256,17 @@ def start_convert(filename):
         return jsonify({"error": "File not found"}), 404
 
     job_id = f"{filename}_{int(time.time())}"
-    active_jobs[job_id] = {
-        "filename": filename,
-        "status": "running",
-        "steps": [],
-        "current_step": 0,
-        "current_label": "",
-        "error": None,
-        "done_message": None,
-        "start_time": time.time(),
-    }
+    with _jobs_lock:
+        active_jobs[job_id] = {
+            "filename": filename,
+            "status": "running",
+            "steps": [],
+            "current_step": 0,
+            "current_label": "",
+            "error": None,
+            "done_message": None,
+            "start_time": time.time(),
+        }
     threading.Thread(
         target=run_conversion_job,
         args=(job_id, acsm_path, OUTPUT_DIR),
@@ -264,9 +278,10 @@ def start_convert(filename):
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
-    if job_id not in active_jobs:
-        return jsonify({"error": "Job not found"}), 404
-    job = active_jobs[job_id]
+    with _jobs_lock:
+        if job_id not in active_jobs:
+            return jsonify({"error": "Job not found"}), 404
+        job = active_jobs[job_id]
     return jsonify({
         "status": job["status"],
         "steps": job["steps"],
@@ -281,29 +296,16 @@ def job_status(job_id):
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
+    """Download an EPUB file. The file is kept in the library for later access."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
         return {"error": "File not found"}, 404
-    resp = send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
-
-    @resp.call_on_close
-    def cleanup():
-        stem = Path(filename).stem
-        try:
-            file_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        for d in (UPLOAD_DIR, COVER_DIR):
-            if d.exists():
-                for f in d.iterdir():
-                    if f.stem == stem or f.stem.startswith(stem):
-                        try:
-                            f.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-
-    return resp
+    # BUG FIX: Do NOT delete the file after download.
+    # The old code had a call_on_close that removed the EPUB + related files,
+    # which broke the library — you could only download once, then the book
+    # vanished. Users should use the explicit /delete endpoint instead.
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 
 @app.route("/delete/<filename>", methods=["POST"])
@@ -372,9 +374,8 @@ def cover(filename):
 @login_required
 def debug_status():
     import shutil
-    return jsonify({
-        "data_dir": str(DATA_DIR),
-        "active_jobs": {
+    with _jobs_lock:
+        jobs_info = {
             jid: {
                 "status": job["status"],
                 "steps_count": len(job["steps"]),
@@ -383,13 +384,16 @@ def debug_status():
                 "elapsed": round(time.time() - job["start_time"]),
             }
             for jid, job in active_jobs.items()
-        },
+        }
+    return jsonify({
+        "data_dir": str(DATA_DIR),
+        "active_jobs": jobs_info,
         "upload_files": [f.name for f in UPLOAD_DIR.iterdir()] if UPLOAD_DIR.exists() else [],
         "output_files": [f.name for f in OUTPUT_DIR.iterdir()] if OUTPUT_DIR.exists() else [],
         "acsmdownloader_found": shutil.which("acsmdownloader")
             or str(SCRIPT_DIR / "libgourou" / "utils" / "acsmdownloader"),
         "libgourou_exists": (SCRIPT_DIR / "libgourou" / "utils" / "acsmdownloader").exists(),
-        "adept_registered": (DATA_DIR / "adept" / "device.xml").exists(),
+        "adept_registered": (Path.home() / ".config" / "adept" / "device.xml").exists(),
     })
 
 
