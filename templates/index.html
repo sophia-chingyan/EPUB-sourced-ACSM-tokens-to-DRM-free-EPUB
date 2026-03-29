@@ -236,6 +236,16 @@
         .confirm-filename { font-weight: 600; word-break: break-all; }
         .confirm-buttons { display: flex; gap: 1rem; margin-top: 1rem; }
         .confirm-buttons button { flex: 1; }
+        .timeout-hint {
+            margin-top: 0.75rem;
+            padding: 0.6rem 1rem;
+            background: #fff3e0;
+            border: 1px solid #ffe0b2;
+            border-radius: 8px;
+            font-size: 0.88rem;
+            color: #e65100;
+            display: none;
+        }
     </style>
 </head>
 <body>
@@ -286,6 +296,11 @@
             <h3>Converting: <span id="converting-name"></span></h3>
             <progress id="progress-bar" value="0" max="6" style="margin-bottom:1rem"></progress>
             <div id="steps"></div>
+            <div class="timeout-hint" id="timeout-hint">
+                ⏳ This step is taking longer than expected. Adobe's servers may be slow.
+                <br>
+                <button class="btn-another" style="margin-top:0.5rem" onclick="resetToUpload()">Cancel &amp; try again</button>
+            </div>
         </section>
 
         <!-- Done -->
@@ -346,6 +361,12 @@
 
     <script>
         const TOTAL_STEPS = 6;
+        // If a single step takes longer than this, show a hint to the user
+        const STEP_TIMEOUT_HINT_MS = 60000;   // 60 seconds
+        // If the entire job exceeds this, show a hard timeout with cancel
+        const JOB_TIMEOUT_MS = 300000;        // 5 minutes (matches server-side)
+        // Number of consecutive poll failures before giving up
+        const MAX_POLL_FAILURES = 10;
 
         const fileInput       = document.getElementById('file-input');
         const uploadSection   = document.getElementById('upload-section');
@@ -364,10 +385,14 @@
         const btnDlEpub       = document.getElementById('btn-dl-epub');
         const linkWarningBox  = document.getElementById('link-warning-box');
         const linkWarningText = document.getElementById('link-warning-text');
+        const timeoutHint     = document.getElementById('timeout-hint');
 
         let pendingFilename = null;
         let elapsedTimer = null;
         let stepStartTime = null;
+        let jobStartTime = null;
+        let stepTimeoutTimer = null;
+        let pollFailCount = 0;
         const stepDivs = {};
         let lastRenderedSteps = 0;
         let hadLinkWarning = false;
@@ -394,9 +419,13 @@
             fileInput.value = '';
             stepsDiv.innerHTML = '';
             linkWarningBox.style.display = 'none';
+            timeoutHint.style.display = 'none';
             Object.keys(stepDivs).forEach(k => delete stepDivs[k]);
             lastRenderedSteps = 0;
             hadLinkWarning = false;
+            pollFailCount = 0;
+            stopElapsedTimer();
+            clearStepTimeout();
         }
 
         async function uploadFile(file) {
@@ -419,6 +448,18 @@
             }
         }
 
+        function clearStepTimeout() {
+            if (stepTimeoutTimer) { clearTimeout(stepTimeoutTimer); stepTimeoutTimer = null; }
+        }
+
+        function resetStepTimeout() {
+            clearStepTimeout();
+            timeoutHint.style.display = 'none';
+            stepTimeoutTimer = setTimeout(() => {
+                timeoutHint.style.display = 'block';
+            }, STEP_TIMEOUT_HINT_MS);
+        }
+
         async function startConversion(filename) {
             confirmSection.style.display = 'none';
             uploadSection.style.display = 'none';
@@ -428,7 +469,11 @@
             progressBar.value = 0;
             lastRenderedSteps = 0;
             hadLinkWarning = false;
+            pollFailCount = 0;
+            timeoutHint.style.display = 'none';
             Object.keys(stepDivs).forEach(k => delete stepDivs[k]);
+
+            jobStartTime = Date.now();
 
             let jobId;
             try {
@@ -447,13 +492,44 @@
             }
 
             showActiveStep(1, 'Checking tools...');
+            resetStepTimeout();
 
             const poller = setInterval(async () => {
+                // Client-side hard timeout
+                if (Date.now() - jobStartTime > JOB_TIMEOUT_MS) {
+                    clearInterval(poller);
+                    stopElapsedTimer();
+                    clearStepTimeout();
+                    Object.values(stepDivs).forEach(d => {
+                        if (d.dataset.status === 'active') {
+                            d.dataset.status = 'error';
+                            const el = d.querySelector('.elapsed');
+                            if (el) el.remove();
+                        }
+                    });
+                    addStep('timeout', 'Job timed out. Adobe servers may be unreachable. Please try again.', 'error');
+                    setTimeout(() => { resetToUpload(); }, 8000);
+                    return;
+                }
+
                 try {
                     const resp = await fetch('/job-status/' + encodeURIComponent(jobId));
                     const text = await resp.text();
                     let data;
-                    try { data = JSON.parse(text); } catch(e) { return; }
+                    try { data = JSON.parse(text); } catch(e) {
+                        pollFailCount++;
+                        if (pollFailCount >= MAX_POLL_FAILURES) {
+                            clearInterval(poller);
+                            stopElapsedTimer();
+                            clearStepTimeout();
+                            addStep('error', 'Lost connection to server.', 'error');
+                            setTimeout(() => { resetToUpload(); }, 6000);
+                        }
+                        return;
+                    }
+
+                    // Reset poll failure counter on success
+                    pollFailCount = 0;
 
                     for (let i = lastRenderedSteps; i < data.steps.length; i++) {
                         const s = data.steps[i];
@@ -467,6 +543,7 @@
                                 }
                             });
                             stopElapsedTimer();
+                            clearStepTimeout();
                             progressBar.value = TOTAL_STEPS;
                             clearInterval(poller);
 
@@ -501,6 +578,9 @@
 
                             const finalStatus = isWarning ? 'warning' : 'done';
 
+                            // A step completed — reset the per-step timeout
+                            resetStepTimeout();
+
                             if (stepDivs[stepNum]) {
                                 stopElapsedTimer();
                                 const div = stepDivs[stepNum];
@@ -529,6 +609,7 @@
                     if (data.status === 'running' && data.current_step > 0) {
                         if (!stepDivs[data.current_step]) {
                             showActiveStep(data.current_step, data.current_label);
+                            resetStepTimeout();
                         }
                     }
 
@@ -541,12 +622,21 @@
                             }
                         });
                         stopElapsedTimer();
+                        clearStepTimeout();
                         addStep('error', data.error, 'error');
                         clearInterval(poller);
                         setTimeout(() => { resetToUpload(); }, 6000);
                     }
                 } catch (err) {
-                    // network error — keep polling
+                    // network error — count failures
+                    pollFailCount++;
+                    if (pollFailCount >= MAX_POLL_FAILURES) {
+                        clearInterval(poller);
+                        stopElapsedTimer();
+                        clearStepTimeout();
+                        addStep('error', 'Lost connection to server after multiple retries.', 'error');
+                        setTimeout(() => { resetToUpload(); }, 6000);
+                    }
                 }
             }, 2000);
         }
