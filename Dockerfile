@@ -26,7 +26,14 @@ RUN cd /app/libgourou \
     && make BUILD_UTILS=1 BUILD_STATIC=1 BUILD_SHARED=0 \
     && ls -la /app/libgourou/utils/acsmdownloader \
     && ls -la /app/libgourou/utils/adept_activate \
-    && ls -la /app/libgourou/utils/adept_remove
+    && ls -la /app/libgourou/utils/adept_remove \
+    && cp /app/libgourou/utils/acsmdownloader /usr/local/bin/ \
+    && cp /app/libgourou/utils/adept_activate  /usr/local/bin/ \
+    && cp /app/libgourou/utils/adept_remove    /usr/local/bin/ \
+    && chmod +x /usr/local/bin/acsmdownloader /usr/local/bin/adept_activate /usr/local/bin/adept_remove
+
+# Make the utils findable via both the local path check and shutil.which
+ENV PATH="/app/libgourou/utils:/usr/local/bin:${PATH}"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

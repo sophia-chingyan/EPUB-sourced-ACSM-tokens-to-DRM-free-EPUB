@@ -39,7 +39,7 @@ def run(cmd, **kwargs):
 
 
 def find_tool(name):
-    """Find a tool, checking local build directory first."""
+    """Find a tool, checking local build directory first, then PATH."""
     local = LIBGOUROU_BIN / name
     if local.exists() and os.access(local, os.X_OK):
         return str(local)
@@ -47,6 +47,17 @@ def find_tool(name):
     if system:
         return system
     return None
+
+
+def _tool_missing_detail(name):
+    """Return a diagnostic string explaining why a tool could not be found."""
+    local = LIBGOUROU_BIN / name
+    not_exec = local.exists() and not os.access(local, os.X_OK)
+    note = ", not executable" if not_exec else ""
+    return (
+        f"{name}: local={local} (exists={local.exists()}{note}), "
+        f"PATH={os.environ.get('PATH', '(unset)')}"
+    )
 
 
 # ─── Setup ───────────────────────────────────────────────────────────────
@@ -658,14 +669,14 @@ def convert_pipeline(acsm_path, output_dir):
 
     # Step 1: Check tools
     problems = []
-    if not find_tool("acsmdownloader"):
-        problems.append("acsmdownloader not found (run: python3 converter.py --setup)")
-    if not find_tool("adept_activate"):
-        problems.append("adept_activate not found (run: python3 converter.py --setup)")
-    if not find_tool("adept_remove"):
-        problems.append("adept_remove not found (run: python3 converter.py --setup)")
+    for tool_name in ("acsmdownloader", "adept_activate", "adept_remove"):
+        if not find_tool(tool_name):
+            problems.append(_tool_missing_detail(tool_name))
     if problems:
-        raise RuntimeError("Missing components: " + "; ".join(set(problems)))
+        raise RuntimeError(
+            "libgourou tools not found. If running in Docker, the image may need "
+            "to be rebuilt. Diagnostics:\n" + "\n".join(problems)
+        )
     yield (1, "All tools ready.", False)
 
     # Step 2: Detect format
