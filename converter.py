@@ -224,47 +224,37 @@ def register_device():
 
     ADEPT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Strategy 1: no-argument invocation (standard libgourou anonymous mode)
+    # The correct flag for anonymous activation is -a / --anonymous.
+    # Previous attempts used -r (wrong) and no-args (prints help, exits 255).
     try:
-        result = run([tool], timeout=60, input="")
+        result = run([tool, "-a"], timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Device registration timed out (60s).")
 
     if result.returncode == 0 and device_file.exists():
-        print("[OK] Adobe device registered (anonymous).")
+        print("[OK] Adobe device registered (anonymous -a).")
         return
 
-    print(f"[DEBUG] No-arg activate exit={result.returncode}, stderr={result.stderr[:200]!r}")
+    print(f"[DEBUG] adept_activate -a exit={result.returncode}")
+    print(f"[DEBUG] stdout: {result.stdout[:400]}")
+    print(f"[DEBUG] stderr: {result.stderr[:400]}")
 
-    # Strategy 2: explicit output directory (some builds require -O)
+    # Fallback: some builds also accept --anonymous (long form)
     try:
-        result = run([tool, "-O", str(ADEPT_DIR)], timeout=60, input="")
+        result = run([tool, "--anonymous"], timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Device registration timed out (60s).")
 
     if result.returncode == 0 and device_file.exists():
-        print("[OK] Adobe device registered (with -O).")
+        print("[OK] Adobe device registered (--anonymous).")
         return
 
-    print(f"[DEBUG] -O activate exit={result.returncode}, stderr={result.stderr[:200]!r}")
-
-    # Strategy 3: some forks accept -r for "random/anonymous"
-    try:
-        result = run([tool, "-r"], timeout=60)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Device registration timed out (60s).")
-
-    if result.returncode == 0 and device_file.exists():
-        print("[OK] Adobe device registered (-r).")
-        return
-
-    # All strategies failed — surface a clear error
     raise RuntimeError(
-        f"Device registration failed after all strategies.\n"
-        f"Last exit code: {result.returncode}\n"
-        f"stdout: {result.stdout[:300]}\n"
-        f"stderr: {result.stderr[:300]}\n"
-        f"Check that {ADEPT_DIR} is writable and that adept_activate is the correct binary."
+        f"Device registration failed.\n"
+        f"Exit code: {result.returncode}\n"
+        f"stdout: {result.stdout[:400]}\n"
+        f"stderr: {result.stderr[:400]}\n"
+        f"ADEPT dir: {ADEPT_DIR} (writable: {os.access(ADEPT_DIR, os.W_OK)})"
     )
 
 
