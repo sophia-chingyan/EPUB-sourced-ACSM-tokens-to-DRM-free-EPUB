@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Flask web interface for the ACSM to EPUB converter (EPUB sources only)."""
+"""Flask web interface for the ACSM converter."""
 
 import os
+import subprocess
 import threading
 import time
 import zipfile
@@ -15,7 +16,7 @@ from flask import (
     send_from_directory, session, redirect, url_for,
 )
 
-from converter import convert_pipeline
+from converter import convert_pipeline, find_ebook_convert
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -24,8 +25,8 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# All mutable data lives under DATA_DIR so a single Zeabur persistent volume
-# mounted at /data survives redeploys. Override with DATA_DIR env var if needed.
+# All mutable data lives under DATA_DIR so a persistent volume survives
+# redeploys. Defaults to /data inside Docker, ./data for local dev.
 _default_data = "/data" if Path("/data").exists() else str(SCRIPT_DIR / "data")
 DATA_DIR   = Path(os.environ.get("DATA_DIR", _default_data))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -35,24 +36,22 @@ COVER_DIR  = DATA_DIR / "covers"
 for _d in (UPLOAD_DIR, OUTPUT_DIR, COVER_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-TOTAL_STEPS = 6
-
-# Maximum time (seconds) a job is allowed to run before being marked as failed.
-# Device registration can take up to ~90s (two 45s attempts), plus download
-# (120s) and DRM removal (60s), so 5 minutes is generous but safe.
-JOB_TIMEOUT = 300
+TOTAL_STEPS = 5
 
 STEP_LABELS = {
     1: "Checking tools...",
     2: "Detecting format...",
     3: "Registering Adobe device...",
-    4: "Downloading EPUB...",
+    4: "Downloading ebook...",
     5: "Removing DRM...",
-    6: "Verifying links...",
 }
 
+# BUG FIX: Protect active_jobs with a lock for thread safety
 _jobs_lock = threading.Lock()
 active_jobs: dict = {}
+
+# Track active EPUB conversions (PDF→EPUB via Calibre)
+active_conversions: dict = {}
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -152,102 +151,57 @@ def get_books():
         return []
     books = OrderedDict()
     for f in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if f.suffix == ".epub":
+        if f.suffix in (".pdf", ".epub"):
             stem = f.stem
             if stem not in books:
-                books[stem] = {"stem": stem, "files": [], "cover": None}
+                books[stem] = {"stem": stem, "files": [], "cover": None, "has_epub": False}
             size_mb = f.stat().st_size / (1024 * 1024)
             books[stem]["files"].append({
                 "name": f.name,
                 "size": f"{size_mb:.1f} MB",
-                "ext": "EPUB",
+                "ext": f.suffix[1:].upper(),
             })
-            if not books[stem]["cover"]:
-                cov = extract_epub_cover(f)
-                if cov:
-                    books[stem]["cover"] = cov
+            if f.suffix == ".epub":
+                books[stem]["has_epub"] = True
+                if not books[stem]["cover"]:
+                    cov = extract_epub_cover(f)
+                    if cov:
+                        books[stem]["cover"] = cov
     return list(books.values())
-
-
-# ── Job helpers ───────────────────────────────────────────────────────────
-
-def _update_job(job_id: str, **updates):
-    """Thread-safe update of job fields."""
-    with _jobs_lock:
-        if job_id in active_jobs:
-            active_jobs[job_id].update(updates)
-
-
-def _append_job_step(job_id: str, step_entry: dict):
-    """Thread-safe append to a job's steps list."""
-    with _jobs_lock:
-        if job_id in active_jobs:
-            active_jobs[job_id]["steps"].append(step_entry)
-
-
-def _check_job_timeout(job_id: str) -> bool:
-    """Return True if the job has exceeded JOB_TIMEOUT."""
-    with _jobs_lock:
-        if job_id not in active_jobs:
-            return True
-        return (time.time() - active_jobs[job_id]["start_time"]) > JOB_TIMEOUT
-
-
-def _expire_stale_jobs():
-    """Mark any running jobs that exceeded the timeout as failed.
-    Called on every /job-status poll so the frontend sees errors promptly."""
-    now = time.time()
-    with _jobs_lock:
-        for jid, job in active_jobs.items():
-            if job["status"] == "running" and (now - job["start_time"]) > JOB_TIMEOUT:
-                job["status"] = "error"
-                job["error"] = (
-                    f"Job timed out after {JOB_TIMEOUT}s. "
-                    "The Adobe server may be unreachable. Please try again."
-                )
 
 
 # ── Conversion job runner ─────────────────────────────────────────────────
 
 def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
     import traceback
+    with _jobs_lock:
+        job = active_jobs[job_id]
     print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
     try:
-        _update_job(job_id, current_step=1, current_label=STEP_LABELS[1])
+        job["current_step"] = 1
+        job["current_label"] = STEP_LABELS[1]
 
         for step, message in convert_pipeline(str(acsm_path), str(output_dir)):
-            # Check for timeout between steps
-            if _check_job_timeout(job_id):
-                raise RuntimeError(
-                    f"Job timed out after {JOB_TIMEOUT}s. "
-                    "The Adobe server may be unreachable."
-                )
-
             print(f"[DEBUG] Job {job_id} step={step} message={message}", flush=True)
             if step == "done":
-                _append_job_step(job_id, {"step": "done", "message": message})
-                _update_job(job_id, status="done", done_message=message)
+                job["steps"].append({"step": "done", "message": message})
+                job["status"] = "done"
+                job["done_message"] = message
             else:
                 step_num = int(step)
-                is_warning = (step_num == 6 and "broken" in message.lower())
-                _append_job_step(job_id, {
-                    "step": step_num,
-                    "message": message,
-                    "warning": is_warning,
-                })
+                job["steps"].append({"step": step_num, "message": message})
                 next_step = step_num + 1
                 if next_step <= TOTAL_STEPS:
-                    _update_job(
-                        job_id,
-                        current_step=next_step,
-                        current_label=STEP_LABELS[next_step],
-                    )
+                    job["current_step"] = next_step
+                    job["current_label"] = STEP_LABELS[next_step]
     except RuntimeError as e:
         print(f"[DEBUG] Job {job_id} RuntimeError: {e}", flush=True)
-        _update_job(job_id, status="error", error=str(e))
+        job["status"] = "error"
+        job["error"] = str(e)
     except Exception as e:
         print(f"[DEBUG] Job {job_id} Exception: {e}\n{traceback.format_exc()}", flush=True)
-        _update_job(job_id, status="error", error=f"Unexpected error: {e}")
+        job["status"] = "error"
+        job["error"] = f"Unexpected error: {e}"
     finally:
         # Clean up the uploaded .acsm file after conversion (success or failure)
         try:
@@ -321,29 +275,106 @@ def start_convert(filename):
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
-    # Expire any timed-out jobs before responding
-    _expire_stale_jobs()
-
     with _jobs_lock:
         if job_id not in active_jobs:
             return jsonify({"error": "Job not found"}), 404
         job = active_jobs[job_id]
-        # Return a snapshot (copy) so we don't hold the lock during response
-        return jsonify({
-            "status": job["status"],
-            "steps": list(job["steps"]),
-            "current_step": job["current_step"],
-            "current_label": job["current_label"],
-            "error": job["error"],
-            "done_message": job["done_message"],
-            "elapsed": round(time.time() - job["start_time"]),
-        })
+    return jsonify({
+        "status": job["status"],
+        "steps": job["steps"],
+        "current_step": job["current_step"],
+        "current_label": job["current_label"],
+        "error": job["error"],
+        "done_message": job["done_message"],
+        "elapsed": round(time.time() - job["start_time"]),
+    })
+
+
+@app.route("/convert-epub/<stem>", methods=["POST"])
+@login_required
+def convert_epub(stem):
+    stem = Path(stem).name
+    if stem in active_conversions:
+        proc = active_conversions[stem]["process"]
+        if proc.poll() is None:
+            return jsonify({"status": "already_running"}), 409
+
+    pdf_path = OUTPUT_DIR / f"{stem}.pdf"
+    epub_path = OUTPUT_DIR / f"{stem}.epub"
+
+    if not pdf_path.exists():
+        return jsonify({"status": "error", "message": "PDF not found"}), 404
+    if epub_path.exists():
+        return jsonify({"status": "error", "message": "EPUB already exists"}), 409
+
+    tool = find_ebook_convert()
+    if not tool:
+        return jsonify({"status": "error", "message": "Calibre not installed"}), 500
+
+    proc = subprocess.Popen(
+        [tool, str(pdf_path), str(epub_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    active_conversions[stem] = {"process": proc, "start_time": time.time()}
+    return jsonify({"status": "started"})
+
+
+@app.route("/convert-epub-status/<stem>")
+@login_required
+def convert_epub_status(stem):
+    stem = Path(stem).name
+    if stem not in active_conversions:
+        epub_path = OUTPUT_DIR / f"{stem}.epub"
+        if epub_path.exists():
+            return jsonify({"status": "done", "elapsed": 0})
+        return jsonify({"status": "not_found"}), 404
+
+    info = active_conversions[stem]
+    proc = info["process"]
+    elapsed = round(time.time() - info["start_time"])
+
+    if proc.poll() is None:
+        return jsonify({"status": "running", "elapsed": elapsed})
+
+    del active_conversions[stem]
+    epub_path = OUTPUT_DIR / f"{stem}.epub"
+    if proc.returncode == 0 and epub_path.exists():
+        return jsonify({"status": "done", "elapsed": elapsed})
+    else:
+        stderr = proc.stderr.read().decode() if proc.stderr else ""
+        return jsonify({"status": "error", "elapsed": elapsed, "message": stderr or "Conversion failed"})
+
+
+@app.route("/stop-convert/<stem>", methods=["POST"])
+@login_required
+def stop_convert(stem):
+    stem = Path(stem).name
+    if stem not in active_conversions:
+        return jsonify({"status": "not_found"}), 404
+
+    info = active_conversions[stem]
+    proc = info["process"]
+    if proc.poll() is None:
+        proc.kill()
+    del active_conversions[stem]
+
+    epub_path = OUTPUT_DIR / f"{stem}.epub"
+    if epub_path.exists():
+        epub_path.unlink()
+
+    return jsonify({"status": "stopped"})
 
 
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
-    """Download an EPUB file. The file is kept in the library for later access."""
+    """Download an ebook file. The file is kept in the library for later access.
+
+    BUG FIX: Do NOT delete the file after download. The old code had a
+    call_on_close that removed the file, which meant you could only download
+    once and then the book vanished from the library. Use /delete to remove.
+    """
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
@@ -388,7 +419,7 @@ def delete_all():
     deleted, errors = [], []
     if OUTPUT_DIR.exists():
         for f in list(OUTPUT_DIR.iterdir()):
-            if f.suffix == ".epub":
+            if f.suffix in (".epub", ".pdf"):
                 try:
                     stem = f.stem
                     f.unlink()
