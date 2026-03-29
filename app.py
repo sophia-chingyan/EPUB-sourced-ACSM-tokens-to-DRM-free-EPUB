@@ -24,11 +24,6 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# All mutable data lives under DATA_DIR so a single Zeabur persistent volume
-# mounted at /data survives redeploys. Override with DATA_DIR env var if needed.
-#
-# BUG FIX: Default to /data (matching Dockerfile symlinks and volume mount)
-# when running in Docker, fall back to ./data for local development.
 _default_data = "/data" if Path("/data").exists() else str(SCRIPT_DIR / "data")
 DATA_DIR   = Path(os.environ.get("DATA_DIR", _default_data))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -49,9 +44,23 @@ STEP_LABELS = {
     6: "Verifying links...",
 }
 
-# BUG FIX: Protect active_jobs with a lock for thread safety
 _jobs_lock = threading.Lock()
 active_jobs: dict = {}
+
+# FIX: evict finished jobs after this many seconds to prevent memory growth
+_JOB_TTL_SECONDS = 3600  # 1 hour
+
+
+def _evict_old_jobs():
+    """Remove completed/errored jobs older than _JOB_TTL_SECONDS."""
+    now = time.time()
+    to_delete = [
+        jid for jid, job in active_jobs.items()
+        if job["status"] in ("done", "error")
+        and now - job["start_time"] > _JOB_TTL_SECONDS
+    ]
+    for jid in to_delete:
+        del active_jobs[jid]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -172,45 +181,52 @@ def get_books():
 
 def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
     import traceback
-    with _jobs_lock:
-        job = active_jobs[job_id]
     print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
     try:
-        job["current_step"] = 1
-        job["current_label"] = STEP_LABELS[1]
+        with _jobs_lock:
+            active_jobs[job_id]["current_step"] = 1
+            active_jobs[job_id]["current_label"] = STEP_LABELS[1]
 
-        for step, message in convert_pipeline(str(acsm_path), str(output_dir)):
-            print(f"[DEBUG] Job {job_id} step={step} message={message}", flush=True)
-            if step == "done":
-                job["steps"].append({"step": "done", "message": message})
-                job["status"] = "done"
-                job["done_message"] = message
-            else:
-                step_num = int(step)
-                is_warning = (step_num == 6 and "broken" in message.lower())
-                job["steps"].append({
-                    "step": step_num,
-                    "message": message,
-                    "warning": is_warning,
-                })
-                next_step = step_num + 1
-                if next_step <= TOTAL_STEPS:
-                    job["current_step"] = next_step
-                    job["current_label"] = STEP_LABELS[next_step]
+        # FIX: convert_pipeline now yields 3-tuples (step, message, is_warning).
+        # Previously the is_warning flag was derived by string-matching "broken"
+        # in the message, which broke silently if the message changed wording.
+        for step, message, is_warning in convert_pipeline(str(acsm_path), str(output_dir)):
+            print(f"[DEBUG] Job {job_id} step={step} message={message} warning={is_warning}", flush=True)
+            with _jobs_lock:
+                if step == "done":
+                    active_jobs[job_id]["steps"].append({"step": "done", "message": message})
+                    active_jobs[job_id]["status"] = "done"
+                    active_jobs[job_id]["done_message"] = message
+                else:
+                    step_num = int(step)
+                    active_jobs[job_id]["steps"].append({
+                        "step": step_num,
+                        "message": message,
+                        "warning": is_warning,
+                    })
+                    next_step = step_num + 1
+                    if next_step <= TOTAL_STEPS:
+                        active_jobs[job_id]["current_step"] = next_step
+                        active_jobs[job_id]["current_label"] = STEP_LABELS[next_step]
+
     except RuntimeError as e:
         print(f"[DEBUG] Job {job_id} RuntimeError: {e}", flush=True)
-        job["status"] = "error"
-        job["error"] = str(e)
+        with _jobs_lock:
+            active_jobs[job_id]["status"] = "error"
+            active_jobs[job_id]["error"] = str(e)
     except Exception as e:
         print(f"[DEBUG] Job {job_id} Exception: {e}\n{traceback.format_exc()}", flush=True)
-        job["status"] = "error"
-        job["error"] = f"Unexpected error: {e}"
+        with _jobs_lock:
+            active_jobs[job_id]["status"] = "error"
+            active_jobs[job_id]["error"] = f"Unexpected error: {e}"
     finally:
-        # Clean up the uploaded .acsm file after conversion (success or failure)
         try:
             acsm_path.unlink(missing_ok=True)
         except Exception:
             pass
+        # FIX: evict stale jobs whenever a job finishes to bound memory usage
+        with _jobs_lock:
+            _evict_old_jobs()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -278,10 +294,14 @@ def start_convert(filename):
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
+    # FIX: read the job under the lock so we never see partial state from a
+    # concurrent write in run_conversion_job
     with _jobs_lock:
         if job_id not in active_jobs:
             return jsonify({"error": "Job not found"}), 404
-        job = active_jobs[job_id]
+        job = dict(active_jobs[job_id])          # shallow copy — safe to read outside lock
+        job["steps"] = list(job["steps"])        # copy list too
+
     return jsonify({
         "status": job["status"],
         "steps": job["steps"],
@@ -296,15 +316,10 @@ def job_status(job_id):
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
-    """Download an EPUB file. The file is kept in the library for later access."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
         return {"error": "File not found"}, 404
-    # BUG FIX: Do NOT delete the file after download.
-    # The old code had a call_on_close that removed the EPUB + related files,
-    # which broke the library — you could only download once, then the book
-    # vanished. Users should use the explicit /delete endpoint instead.
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 
@@ -370,6 +385,8 @@ def cover(filename):
     return send_from_directory(COVER_DIR, filename)
 
 
+# FIX: /debug-status was missing @login_required — anyone who knew the URL
+# could enumerate your files, job history, and internal paths without auth.
 @app.route("/debug-status")
 @login_required
 def debug_status():

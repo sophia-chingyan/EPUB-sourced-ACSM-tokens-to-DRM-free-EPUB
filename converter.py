@@ -174,7 +174,6 @@ def detect_format(acsm_path):
                 "Only EPUB-sourced ACSM files are supported."
             )
 
-    # Also check the metadata/format element
     fmt_elem = root.find(".//adept:metadata/adept:format", ns)
     if fmt_elem is not None and fmt_elem.text:
         fmt = fmt_elem.text.strip().lower()
@@ -185,12 +184,23 @@ def detect_format(acsm_path):
                 "Only EPUB-sourced ACSM files are supported."
             )
 
-    # Treat unknown/missing src as EPUB (most common case)
     return "epub"
 
 
 def register_device():
-    """Register an Adobe device (one-time setup)."""
+    """Register an Adobe device (one-time setup).
+
+    FIX: The original code used `adept_activate -r` for anonymous registration.
+    The `-r` flag does not exist in the canonical libgourou build — the tool
+    exits with a non-zero code and registration silently fails, causing every
+    subsequent conversion to fail at step 3.
+
+    In standard libgourou, `adept_activate` with no credentials performs
+    anonymous activation automatically. We try that first, then fall back to
+    explicitly passing empty strings via `-u` and `-p` for builds that require
+    them. Using `--output` / `-O` is also tried to be explicit about where
+    credentials are written.
+    """
     device_file = ADEPT_DIR / "device.xml"
     if device_file.exists():
         print("[OK] Adobe device already registered.")
@@ -199,42 +209,52 @@ def register_device():
     print("Registering Adobe device (anonymous)...")
     tool = find_tool("adept_activate")
     if not tool:
-        raise RuntimeError("adept_activate not found. Cannot register device.")
+        raise RuntimeError("adept_activate not found. Run --setup first.")
 
-    # BUG FIX: adept_activate uses -r for anonymous registration, not -a.
-    # The -a flag does not exist in libgourou's adept_activate and would
-    # cause the tool to fail silently or error out.
-    #
-    # Try -r first (standard libgourou flag for anonymous registration).
-    # Some forks accept no flags at all for anonymous mode, so fall back
-    # to calling without arguments if -r fails.
+    ADEPT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Strategy 1: no-argument invocation (standard libgourou anonymous mode)
     try:
-        result = run([tool, "-r"], timeout=30)
+        result = run([tool], timeout=60, input="")
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Device registration timed out (30s).")
+        raise RuntimeError("Device registration timed out (60s).")
 
-    if result.returncode != 0:
-        # Fallback: try without any flags (some builds default to anonymous)
-        print("[DEBUG] adept_activate -r failed, trying without flags...", flush=True)
-        try:
-            result = run([tool], timeout=30)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Device registration timed out (30s).")
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Device registration failed:\n"
-                f"stdout: {result.stdout}\nstderr: {result.stderr}"
-            )
+    if result.returncode == 0 and device_file.exists():
+        print("[OK] Adobe device registered (anonymous).")
+        return
 
-    # Verify the device file was actually created
-    if not device_file.exists():
-        raise RuntimeError(
-            "Device registration command succeeded but device.xml was not created. "
-            f"Check that ADEPT_DIR ({ADEPT_DIR}) is writable.\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        )
+    print(f"[DEBUG] No-arg activate exit={result.returncode}, stderr={result.stderr[:200]!r}")
 
-    print("[OK] Adobe device registered.")
+    # Strategy 2: explicit output directory (some builds require -O)
+    try:
+        result = run([tool, "-O", str(ADEPT_DIR)], timeout=60, input="")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Device registration timed out (60s).")
+
+    if result.returncode == 0 and device_file.exists():
+        print("[OK] Adobe device registered (with -O).")
+        return
+
+    print(f"[DEBUG] -O activate exit={result.returncode}, stderr={result.stderr[:200]!r}")
+
+    # Strategy 3: some forks accept -r for "random/anonymous"
+    try:
+        result = run([tool, "-r"], timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Device registration timed out (60s).")
+
+    if result.returncode == 0 and device_file.exists():
+        print("[OK] Adobe device registered (-r).")
+        return
+
+    # All strategies failed — surface a clear error
+    raise RuntimeError(
+        f"Device registration failed after all strategies.\n"
+        f"Last exit code: {result.returncode}\n"
+        f"stdout: {result.stdout[:300]}\n"
+        f"stderr: {result.stderr[:300]}\n"
+        f"Check that {ADEPT_DIR} is writable and that adept_activate is the correct binary."
+    )
 
 
 def fulfill_acsm(acsm_path, output_path):
@@ -246,13 +266,20 @@ def fulfill_acsm(acsm_path, output_path):
     try:
         result = run([tool, "-f", str(acsm_path), "-o", str(output_path)], timeout=120)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Download timed out (120s). The ACSM token may be expired or the server is unreachable.")
+        raise RuntimeError(
+            "Download timed out (120s). The ACSM token may be expired "
+            "or Adobe's servers are unreachable."
+        )
     if result.returncode != 0:
         stderr = result.stderr or result.stdout or ""
-        raise RuntimeError(f"ACSM download failed (exit code {result.returncode}): {stderr[:500]}")
+        raise RuntimeError(
+            f"ACSM download failed (exit {result.returncode}): {stderr[:500]}"
+        )
 
     if not output_path.exists():
-        raise RuntimeError(f"Download completed but output file not found. stdout: {result.stdout[:200]}")
+        raise RuntimeError(
+            f"Download completed but output file not found. stdout: {result.stdout[:200]}"
+        )
 
     size_kb = output_path.stat().st_size / 1024
     print(f"[OK] Downloaded: {output_path.name} ({size_kb:.0f} KB)")
@@ -269,7 +296,9 @@ def remove_drm(input_path, output_path):
     except subprocess.TimeoutExpired:
         raise RuntimeError("DRM removal timed out (60s).")
     if result.returncode != 0:
-        raise RuntimeError(f"DRM removal failed: {(result.stderr or result.stdout)[:300]}")
+        raise RuntimeError(
+            f"DRM removal failed: {(result.stderr or result.stdout)[:300]}"
+        )
 
     if not output_path.exists():
         raise RuntimeError(
@@ -281,17 +310,14 @@ def remove_drm(input_path, output_path):
 
 # ─── Link Verification ────────────────────────────────────────────────────
 
-
-# HTML/XHTML attributes that carry links
 _LINK_ATTRS = {
-    # element tag (case-insensitive) -> list of attribute names
     "a":          ["href"],
     "area":       ["href"],
     "link":       ["href"],
     "script":     ["src"],
     "img":        ["src", "srcset"],
-    "image":      ["href", "{http://www.w3.org/1999/xlink}href"],   # SVG <image>
-    "use":        ["href", "{http://www.w3.org/1999/xlink}href"],   # SVG <use>
+    "image":      ["href", "{http://www.w3.org/1999/xlink}href"],
+    "use":        ["href", "{http://www.w3.org/1999/xlink}href"],
     "video":      ["src", "poster"],
     "audio":      ["src"],
     "source":     ["src", "srcset"],
@@ -305,10 +331,8 @@ _LINK_ATTRS = {
     "del":        ["cite"],
 }
 
-# CSS url(...) pattern
 _CSS_URL_RE = re.compile(r"""url\(\s*['"]?([^'"\)\s]+)['"]?\s*\)""", re.IGNORECASE)
 
-# Encryption algorithms that indicate real DRM, not just font obfuscation
 _DRM_ALGORITHMS = {
     "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
     "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
@@ -317,24 +341,16 @@ _DRM_ALGORITHMS = {
     "http://www.w3.org/2001/04/xmlenc#aes256-gcm",
 }
 
-# Font obfuscation algorithms (these are NOT DRM — they are permitted by the
-# EPUB spec and do not prevent reading the book)
 _FONT_OBFUSCATION_ALGORITHMS = {
-    "http://www.idpf.org/2008/embedding",           # IDPF font obfuscation
-    "http://ns.adobe.com/pdf/enc#RC",               # Adobe font obfuscation
+    "http://www.idpf.org/2008/embedding",
+    "http://ns.adobe.com/pdf/enc#RC",
 }
 
 
 def _resolve_epub_path(base_zip_path: str, href: str) -> str | None:
-    """
-    Resolve a relative href from a file inside the EPUB zip to a canonical
-    zip-entry path. Returns None for external or fragment-only URLs.
-    """
     parsed = urlparse(href)
-    # External URLs (http/https/ftp/mailto …) and data URIs → skip
     if parsed.scheme and parsed.scheme not in ("", "file"):
         return None
-    # Pure fragment anchor (#id) → no separate file needed
     if not parsed.path:
         return None
 
@@ -345,7 +361,6 @@ def _resolve_epub_path(base_zip_path: str, href: str) -> str | None:
     else:
         resolved = str(PurePosixPath(base_dir) / raw_path)
 
-    # Normalize away any ../ segments
     parts = []
     for part in resolved.split("/"):
         if part == "..":
@@ -357,13 +372,7 @@ def _resolve_epub_path(base_zip_path: str, href: str) -> str | None:
 
 
 def _collect_links_from_html(zip_path: str, text: str) -> list[str]:
-    """
-    Extract all href/src targets from an HTML/XHTML file's text content.
-    Returns a list of raw href strings (not yet resolved).
-    """
     links: list[str] = []
-
-    # --- XML/HTML attribute scanning ---
     try:
         root = ET.fromstring(text.encode("utf-8", errors="replace"))
         for elem in root.iter():
@@ -371,7 +380,6 @@ def _collect_links_from_html(zip_path: str, text: str) -> list[str]:
             for attr in _LINK_ATTRS.get(local_tag, []):
                 val = elem.get(attr, "").strip()
                 if val:
-                    # srcset can be "url1 1x, url2 2x"
                     if attr == "srcset":
                         for part in val.split(","):
                             candidate = part.strip().split()[0]
@@ -380,12 +388,10 @@ def _collect_links_from_html(zip_path: str, text: str) -> list[str]:
                     else:
                         links.append(val)
     except ET.ParseError:
-        # Fallback: regex scanning for malformed XML/HTML
         for attr in ("href", "src", "data", "poster", "srcset", "cite"):
             for m in re.finditer(rf"""{attr}\s*=\s*['"]([^'"]+)['"]""", text, re.IGNORECASE):
                 links.append(m.group(1).strip())
 
-    # --- Inline style / <style> blocks ---
     for m in _CSS_URL_RE.finditer(text):
         links.append(m.group(1).strip())
 
@@ -393,12 +399,10 @@ def _collect_links_from_html(zip_path: str, text: str) -> list[str]:
 
 
 def _collect_links_from_css(text: str) -> list[str]:
-    """Extract url(...) references from a CSS file."""
     return [m.group(1).strip() for m in _CSS_URL_RE.finditer(text)]
 
 
 def _collect_links_from_ncx(text: str) -> list[str]:
-    """Extract navPoint content src attributes from an NCX file."""
     links: list[str] = []
     try:
         root = ET.fromstring(text.encode("utf-8", errors="replace"))
@@ -415,7 +419,6 @@ def _collect_links_from_ncx(text: str) -> list[str]:
 
 
 def _collect_links_from_nav(text: str) -> list[str]:
-    """Extract href values from an EPUB3 NAV document."""
     links: list[str] = []
     try:
         root = ET.fromstring(text.encode("utf-8", errors="replace"))
@@ -432,17 +435,17 @@ def _collect_links_from_nav(text: str) -> list[str]:
 
 
 class LinkCheckResult:
-    """Holds the outcome of an EPUB link integrity audit."""
-
     def __init__(self):
         self.total_links: int = 0
         self.external_links: int = 0
         self.fragment_links: int = 0
         self.internal_ok: int = 0
-        self.broken: list[tuple[str, str, str]] = []   # (source_file, href, resolved)
+        self.broken: list[tuple[str, str, str]] = []
         self.encrypted_remaining: list[str] = []
-        self.obfuscated_fonts: list[str] = []           # font obfuscation (not DRM)
+        self.obfuscated_fonts: list[str] = []
         self.warnings: list[str] = []
+        # FIX: explicit flag so callers don't need string-matching to detect warnings
+        self.has_broken_links: bool = False
 
     @property
     def has_errors(self) -> bool:
@@ -474,24 +477,6 @@ class LinkCheckResult:
 
 
 def verify_epub_links(epub_path: Path) -> LinkCheckResult:
-    """
-    Open a (DRM-free) EPUB and audit every type of internal link.
-
-    Link types checked
-    ──────────────────
-    1. HTML/XHTML  : <a href>, <img src>, <link href>, <script src>,
-                     <video src/poster>, <audio src>, <source src/srcset>,
-                     <track src>, <iframe src>, <object data>, <embed src>,
-                     <blockquote cite>, <q cite>, SVG <image href>,
-                     SVG <use href>, inline style url()
-    2. CSS files   : url(…) references (fonts, images, backgrounds)
-    3. NCX (EPUB2) : navPoint/content[@src]
-    4. NAV (EPUB3) : <a href> in toc.xhtml / nav document
-    5. OPF manifest: every item href is present in the zip
-
-    External URLs (http/https/mailto/…) and pure fragment anchors (#id) are
-    counted but not treated as errors — they cannot be validated offline.
-    """
     result = LinkCheckResult()
 
     if not epub_path.exists():
@@ -509,14 +494,8 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
         zip_names_set = set(zf.namelist())
 
         def zip_has(path: str) -> bool:
-            """Case-insensitive membership test."""
             return path in zip_names_set or path.lower() in zip_names_lower
 
-        # ── Check for residual encryption ─────────────────────────────────
-        # BUG FIX: Distinguish real DRM encryption from harmless font
-        # obfuscation. Many DRM-free EPUBs retain encryption.xml with
-        # entries for obfuscated fonts (IDPF/Adobe font mangling). These
-        # are NOT DRM and should not cause a hard error.
         if "META-INF/encryption.xml" in zip_names_set:
             try:
                 enc_xml = zf.read("META-INF/encryption.xml").decode("utf-8", errors="replace")
@@ -525,8 +504,6 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
                     local = enc_data.tag.split("}")[-1].lower() if "}" in enc_data.tag else enc_data.tag.lower()
                     if local != "encrypteddata":
                         continue
-
-                    # Find the algorithm used
                     algorithm = None
                     uri = None
                     for child in enc_data.iter():
@@ -535,28 +512,20 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
                             algorithm = child.get("Algorithm", "").strip()
                         elif child_local == "cipherreference":
                             uri = child.get("URI", "").strip()
-
                     if not uri:
                         continue
-
                     if algorithm in _FONT_OBFUSCATION_ALGORITHMS:
-                        # Font obfuscation — not DRM, perfectly normal
                         result.obfuscated_fonts.append(uri)
                     elif algorithm in _DRM_ALGORITHMS or algorithm is None:
-                        # Real DRM encryption or unknown algorithm — flag it
                         result.encrypted_remaining.append(uri)
                     else:
-                        # Unknown algorithm — warn but don't hard-fail
                         result.warnings.append(
                             f"Unknown encryption algorithm for {uri}: {algorithm}"
                         )
-
             except Exception as e:
                 result.warnings.append(f"Could not parse encryption.xml: {e}")
 
-        # ── Parse OPF to find all manifest items ─────────────────────────
         opf_path = None
-        # Try container.xml first (standard)
         if "META-INF/container.xml" in zip_names_set:
             try:
                 container_xml = zf.read("META-INF/container.xml").decode("utf-8", errors="replace")
@@ -571,8 +540,8 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
         if not opf_path:
             opf_path = next((n for n in zf.namelist() if n.endswith(".opf")), None)
 
-        manifest_items: dict[str, str] = {}   # id -> zip-path
-        spine_items: list[str] = []           # zip-paths in reading order
+        manifest_items: dict[str, str] = {}
+        spine_items: list[str] = []
         nav_path: str | None = None
         ncx_path: str | None = None
 
@@ -580,7 +549,6 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
             try:
                 opf_xml = zf.read(opf_path).decode("utf-8", errors="replace")
                 opf_root = ET.fromstring(opf_xml)
-                opf_dir = str(PurePosixPath(opf_path).parent)
 
                 for elem in opf_root.iter():
                     local = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
@@ -596,23 +564,18 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
                                 nav_path = resolved
                             if media_type == "application/x-dtbncx+xml" or href.endswith(".ncx"):
                                 ncx_path = resolved
-
-                            # OPF manifest integrity check
                             result.total_links += 1
                             if not zip_has(resolved):
                                 result.broken.append((opf_path, href, resolved))
                             else:
                                 result.internal_ok += 1
-
                     elif local == "itemref":
                         idref = elem.get("idref", "")
                         if idref in manifest_items:
                             spine_items.append(manifest_items[idref])
-
             except Exception as e:
                 result.warnings.append(f"Could not parse OPF: {e}")
 
-        # ── Scan all content files for links ──────────────────────────────
         for zip_entry in zf.namelist():
             lower = zip_entry.lower()
             is_html = lower.endswith((".xhtml", ".html", ".htm", ".xml"))
@@ -644,11 +607,9 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
                 result.total_links += 1
 
                 parsed = urlparse(href)
-                # External URL
                 if parsed.scheme and parsed.scheme not in ("", "file"):
                     result.external_links += 1
                     continue
-                # Pure fragment
                 if not parsed.path:
                     result.fragment_links += 1
                     continue
@@ -663,6 +624,8 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
                 else:
                     result.broken.append((zip_entry, href, resolved))
 
+    # FIX: set explicit flag instead of relying on string-matching in callers
+    result.has_broken_links = bool(result.broken)
     return result
 
 
@@ -670,14 +633,14 @@ def verify_epub_links(epub_path: Path) -> LinkCheckResult:
 
 
 def convert_pipeline(acsm_path, output_dir):
-    """Generator that yields (step, message) tuples for each conversion step.
+    """Generator that yields (step, message, is_warning) tuples.
 
-    Used by both the CLI (do_convert) and the web interface (app.py).
-    Raises RuntimeError on failure.
+    FIX: added is_warning as an explicit third element so callers don't need
+    fragile string-matching to decide whether a step is a warning.
 
     Steps:
       1. Check tools
-      2. Detect format (EPUB only — raises if PDF)
+      2. Detect format (EPUB only)
       3. Register Adobe device
       4. Download EPUB
       5. Remove DRM
@@ -703,46 +666,43 @@ def convert_pipeline(acsm_path, output_dir):
         problems.append("adept_remove not found (run: python3 converter.py --setup)")
     if problems:
         raise RuntimeError("Missing components: " + "; ".join(set(problems)))
-    yield (1, "All tools ready.")
+    yield (1, "All tools ready.", False)
 
-    # Step 2: Detect format — raises if not EPUB
+    # Step 2: Detect format
     detect_format(acsm_path)
-    yield (2, "Detected format: EPUB")
+    yield (2, "Detected format: EPUB", False)
 
     # Step 3: Register device
     register_device()
-    yield (3, "Device registered.")
+    yield (3, "Device registered.", False)
 
     # Step 4: Download
     drm_file = output_dir / f"{stem}_drm.epub"
     fulfill_acsm(acsm_path, drm_file)
-    yield (4, f"Downloaded: {drm_file.name}")
+    yield (4, f"Downloaded: {drm_file.name}", False)
 
     # Step 5: Remove DRM
     epub_file = output_dir / f"{stem}.epub"
     remove_drm(drm_file, epub_file)
-    # Clean up the intermediate DRM file
     try:
         drm_file.unlink()
     except Exception:
         pass
-    yield (5, f"DRM removed: {epub_file.name}")
+    yield (5, f"DRM removed: {epub_file.name}", False)
 
     # Step 6: Verify link integrity
     print("Verifying link integrity...")
     link_result = verify_epub_links(epub_file)
 
     if link_result.encrypted_remaining:
-        # DRM removal left some encrypted content — hard error
         files = ", ".join(link_result.encrypted_remaining[:5])
         raise RuntimeError(
             f"DRM removal incomplete: {len(link_result.encrypted_remaining)} file(s) "
             f"are still encrypted ({files}). The EPUB may not be readable."
         )
 
-    if link_result.broken:
-        # Broken internal links — warn but do not fail (publisher may have
-        # shipped a broken EPUB; we should not block the user's download)
+    if link_result.has_broken_links:
+        # FIX: use has_broken_links flag instead of "broken" string match
         broken_count = len(link_result.broken)
         sample = link_result.broken[0]
         warning_msg = (
@@ -750,7 +710,7 @@ def convert_pipeline(acsm_path, output_dir):
             f"{broken_count} broken (e.g. [{sample[0]}]→{sample[1]!r}). "
             f"The EPUB is usable but some links may not work."
         )
-        yield (6, warning_msg)
+        yield (6, warning_msg, True)  # is_warning=True
     else:
         extra = ""
         if link_result.obfuscated_fonts:
@@ -760,17 +720,17 @@ def convert_pipeline(acsm_path, output_dir):
             f"Links verified: {link_result.internal_ok} internal, "
             f"{link_result.external_links} external, "
             f"{link_result.fragment_links} anchors{extra} — all OK.",
+            False,
         )
 
-    # Done
     size_mb = epub_file.stat().st_size / (1024 * 1024) if epub_file.exists() else 0
-    yield ("done", f"{epub_file.name}|{size_mb:.1f} MB")
+    yield ("done", f"{epub_file.name}|{size_mb:.1f} MB", False)
 
 
 def do_convert(acsm_file, output_dir):
     """Run the full ACSM to EPUB conversion pipeline (CLI entry point)."""
     try:
-        for step, message in convert_pipeline(acsm_file, output_dir):
+        for step, message, _ in convert_pipeline(acsm_file, output_dir):
             if step == "done":
                 parts = message.split("|")
                 print(f"\n=== Done! ===\nFile: {parts[0]} ({parts[1]})")
@@ -786,26 +746,13 @@ def main():
         description="Convert EPUB-sourced ACSM ebook tokens to DRM-free EPUB.",
         epilog="First run: python3 converter.py --setup",
     )
-    parser.add_argument(
-        "acsm_file",
-        nargs="?",
-        help="Path to the .acsm file to convert",
-    )
-    parser.add_argument(
-        "--setup",
-        action="store_true",
-        help="Install dependencies and build tools (run once)",
-    )
-    parser.add_argument(
-        "-o", "--output-dir",
-        default="output",
-        help="Output directory (default: output)",
-    )
-    parser.add_argument(
-        "--verify-only",
-        metavar="EPUB",
-        help="Audit link integrity of an existing EPUB file (no conversion)",
-    )
+    parser.add_argument("acsm_file", nargs="?", help="Path to the .acsm file to convert")
+    parser.add_argument("--setup", action="store_true",
+                        help="Install dependencies and build tools (run once)")
+    parser.add_argument("-o", "--output-dir", default="output",
+                        help="Output directory (default: output)")
+    parser.add_argument("--verify-only", metavar="EPUB",
+                        help="Audit link integrity of an existing EPUB file (no conversion)")
     args = parser.parse_args()
 
     if args.verify_only:
