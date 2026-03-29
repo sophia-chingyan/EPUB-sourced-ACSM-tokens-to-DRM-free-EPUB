@@ -24,6 +24,8 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# All mutable data lives under DATA_DIR so a single Zeabur persistent volume
+# mounted at /data survives redeploys. Override with DATA_DIR env var if needed.
 _default_data = "/data" if Path("/data").exists() else str(SCRIPT_DIR / "data")
 DATA_DIR   = Path(os.environ.get("DATA_DIR", _default_data))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -34,6 +36,11 @@ for _d in (UPLOAD_DIR, OUTPUT_DIR, COVER_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 TOTAL_STEPS = 6
+
+# Maximum time (seconds) a job is allowed to run before being marked as failed.
+# Device registration can take up to ~90s (two 45s attempts), plus download
+# (120s) and DRM removal (60s), so 5 minutes is generous but safe.
+JOB_TIMEOUT = 300
 
 STEP_LABELS = {
     1: "Checking tools...",
@@ -46,21 +53,6 @@ STEP_LABELS = {
 
 _jobs_lock = threading.Lock()
 active_jobs: dict = {}
-
-# FIX: evict finished jobs after this many seconds to prevent memory growth
-_JOB_TTL_SECONDS = 3600  # 1 hour
-
-
-def _evict_old_jobs():
-    """Remove completed/errored jobs older than _JOB_TTL_SECONDS."""
-    now = time.time()
-    to_delete = [
-        jid for jid, job in active_jobs.items()
-        if job["status"] in ("done", "error")
-        and now - job["start_time"] > _JOB_TTL_SECONDS
-    ]
-    for jid in to_delete:
-        del active_jobs[jid]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -177,56 +169,91 @@ def get_books():
     return list(books.values())
 
 
+# ── Job helpers ───────────────────────────────────────────────────────────
+
+def _update_job(job_id: str, **updates):
+    """Thread-safe update of job fields."""
+    with _jobs_lock:
+        if job_id in active_jobs:
+            active_jobs[job_id].update(updates)
+
+
+def _append_job_step(job_id: str, step_entry: dict):
+    """Thread-safe append to a job's steps list."""
+    with _jobs_lock:
+        if job_id in active_jobs:
+            active_jobs[job_id]["steps"].append(step_entry)
+
+
+def _check_job_timeout(job_id: str) -> bool:
+    """Return True if the job has exceeded JOB_TIMEOUT."""
+    with _jobs_lock:
+        if job_id not in active_jobs:
+            return True
+        return (time.time() - active_jobs[job_id]["start_time"]) > JOB_TIMEOUT
+
+
+def _expire_stale_jobs():
+    """Mark any running jobs that exceeded the timeout as failed.
+    Called on every /job-status poll so the frontend sees errors promptly."""
+    now = time.time()
+    with _jobs_lock:
+        for jid, job in active_jobs.items():
+            if job["status"] == "running" and (now - job["start_time"]) > JOB_TIMEOUT:
+                job["status"] = "error"
+                job["error"] = (
+                    f"Job timed out after {JOB_TIMEOUT}s. "
+                    "The Adobe server may be unreachable. Please try again."
+                )
+
+
 # ── Conversion job runner ─────────────────────────────────────────────────
 
 def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
     import traceback
     print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
     try:
-        with _jobs_lock:
-            active_jobs[job_id]["current_step"] = 1
-            active_jobs[job_id]["current_label"] = STEP_LABELS[1]
+        _update_job(job_id, current_step=1, current_label=STEP_LABELS[1])
 
-        # FIX: convert_pipeline now yields 3-tuples (step, message, is_warning).
-        # Previously the is_warning flag was derived by string-matching "broken"
-        # in the message, which broke silently if the message changed wording.
-        for step, message, is_warning in convert_pipeline(str(acsm_path), str(output_dir)):
-            print(f"[DEBUG] Job {job_id} step={step} message={message} warning={is_warning}", flush=True)
-            with _jobs_lock:
-                if step == "done":
-                    active_jobs[job_id]["steps"].append({"step": "done", "message": message})
-                    active_jobs[job_id]["status"] = "done"
-                    active_jobs[job_id]["done_message"] = message
-                else:
-                    step_num = int(step)
-                    active_jobs[job_id]["steps"].append({
-                        "step": step_num,
-                        "message": message,
-                        "warning": is_warning,
-                    })
-                    next_step = step_num + 1
-                    if next_step <= TOTAL_STEPS:
-                        active_jobs[job_id]["current_step"] = next_step
-                        active_jobs[job_id]["current_label"] = STEP_LABELS[next_step]
+        for step, message in convert_pipeline(str(acsm_path), str(output_dir)):
+            # Check for timeout between steps
+            if _check_job_timeout(job_id):
+                raise RuntimeError(
+                    f"Job timed out after {JOB_TIMEOUT}s. "
+                    "The Adobe server may be unreachable."
+                )
 
+            print(f"[DEBUG] Job {job_id} step={step} message={message}", flush=True)
+            if step == "done":
+                _append_job_step(job_id, {"step": "done", "message": message})
+                _update_job(job_id, status="done", done_message=message)
+            else:
+                step_num = int(step)
+                is_warning = (step_num == 6 and "broken" in message.lower())
+                _append_job_step(job_id, {
+                    "step": step_num,
+                    "message": message,
+                    "warning": is_warning,
+                })
+                next_step = step_num + 1
+                if next_step <= TOTAL_STEPS:
+                    _update_job(
+                        job_id,
+                        current_step=next_step,
+                        current_label=STEP_LABELS[next_step],
+                    )
     except RuntimeError as e:
         print(f"[DEBUG] Job {job_id} RuntimeError: {e}", flush=True)
-        with _jobs_lock:
-            active_jobs[job_id]["status"] = "error"
-            active_jobs[job_id]["error"] = str(e)
+        _update_job(job_id, status="error", error=str(e))
     except Exception as e:
         print(f"[DEBUG] Job {job_id} Exception: {e}\n{traceback.format_exc()}", flush=True)
-        with _jobs_lock:
-            active_jobs[job_id]["status"] = "error"
-            active_jobs[job_id]["error"] = f"Unexpected error: {e}"
+        _update_job(job_id, status="error", error=f"Unexpected error: {e}")
     finally:
+        # Clean up the uploaded .acsm file after conversion (success or failure)
         try:
             acsm_path.unlink(missing_ok=True)
         except Exception:
             pass
-        # FIX: evict stale jobs whenever a job finishes to bound memory usage
-        with _jobs_lock:
-            _evict_old_jobs()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────
@@ -294,28 +321,29 @@ def start_convert(filename):
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
-    # FIX: read the job under the lock so we never see partial state from a
-    # concurrent write in run_conversion_job
+    # Expire any timed-out jobs before responding
+    _expire_stale_jobs()
+
     with _jobs_lock:
         if job_id not in active_jobs:
             return jsonify({"error": "Job not found"}), 404
-        job = dict(active_jobs[job_id])          # shallow copy — safe to read outside lock
-        job["steps"] = list(job["steps"])        # copy list too
-
-    return jsonify({
-        "status": job["status"],
-        "steps": job["steps"],
-        "current_step": job["current_step"],
-        "current_label": job["current_label"],
-        "error": job["error"],
-        "done_message": job["done_message"],
-        "elapsed": round(time.time() - job["start_time"]),
-    })
+        job = active_jobs[job_id]
+        # Return a snapshot (copy) so we don't hold the lock during response
+        return jsonify({
+            "status": job["status"],
+            "steps": list(job["steps"]),
+            "current_step": job["current_step"],
+            "current_label": job["current_label"],
+            "error": job["error"],
+            "done_message": job["done_message"],
+            "elapsed": round(time.time() - job["start_time"]),
+        })
 
 
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
+    """Download an EPUB file. The file is kept in the library for later access."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
@@ -385,8 +413,6 @@ def cover(filename):
     return send_from_directory(COVER_DIR, filename)
 
 
-# FIX: /debug-status was missing @login_required — anyone who knew the URL
-# could enumerate your files, job history, and internal paths without auth.
 @app.route("/debug-status")
 @login_required
 def debug_status():
