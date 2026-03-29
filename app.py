@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Flask web interface for the ACSM converter."""
+"""Flask web interface for the ACSM to EPUB converter (EPUB sources only)."""
 
 import os
-import subprocess
 import threading
 import time
 import zipfile
@@ -16,7 +15,7 @@ from flask import (
     send_from_directory, session, redirect, url_for,
 )
 
-from converter import convert_pipeline, find_ebook_convert
+from converter import convert_pipeline
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -25,8 +24,11 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# All mutable data lives under DATA_DIR so a persistent volume survives
-# redeploys. Defaults to /data inside Docker, ./data for local dev.
+# All mutable data lives under DATA_DIR so a single Zeabur persistent volume
+# mounted at /data survives redeploys. Override with DATA_DIR env var if needed.
+#
+# BUG FIX: Default to /data (matching Dockerfile symlinks and volume mount)
+# when running in Docker, fall back to ./data for local development.
 _default_data = "/data" if Path("/data").exists() else str(SCRIPT_DIR / "data")
 DATA_DIR   = Path(os.environ.get("DATA_DIR", _default_data))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -36,22 +38,20 @@ COVER_DIR  = DATA_DIR / "covers"
 for _d in (UPLOAD_DIR, OUTPUT_DIR, COVER_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-TOTAL_STEPS = 5
+TOTAL_STEPS = 6
 
 STEP_LABELS = {
     1: "Checking tools...",
     2: "Detecting format...",
     3: "Registering Adobe device...",
-    4: "Downloading ebook...",
+    4: "Downloading EPUB...",
     5: "Removing DRM...",
+    6: "Verifying links...",
 }
 
 # BUG FIX: Protect active_jobs with a lock for thread safety
 _jobs_lock = threading.Lock()
 active_jobs: dict = {}
-
-# Track active EPUB conversions (PDF→EPUB via Calibre)
-active_conversions: dict = {}
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -151,22 +151,20 @@ def get_books():
         return []
     books = OrderedDict()
     for f in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if f.suffix in (".pdf", ".epub"):
+        if f.suffix == ".epub":
             stem = f.stem
             if stem not in books:
-                books[stem] = {"stem": stem, "files": [], "cover": None, "has_epub": False}
+                books[stem] = {"stem": stem, "files": [], "cover": None}
             size_mb = f.stat().st_size / (1024 * 1024)
             books[stem]["files"].append({
                 "name": f.name,
                 "size": f"{size_mb:.1f} MB",
-                "ext": f.suffix[1:].upper(),
+                "ext": "EPUB",
             })
-            if f.suffix == ".epub":
-                books[stem]["has_epub"] = True
-                if not books[stem]["cover"]:
-                    cov = extract_epub_cover(f)
-                    if cov:
-                        books[stem]["cover"] = cov
+            if not books[stem]["cover"]:
+                cov = extract_epub_cover(f)
+                if cov:
+                    books[stem]["cover"] = cov
     return list(books.values())
 
 
@@ -189,7 +187,12 @@ def run_conversion_job(job_id: str, acsm_path: Path, output_dir: Path):
                 job["done_message"] = message
             else:
                 step_num = int(step)
-                job["steps"].append({"step": step_num, "message": message})
+                is_warning = (step_num == 6 and "broken" in message.lower())
+                job["steps"].append({
+                    "step": step_num,
+                    "message": message,
+                    "warning": is_warning,
+                })
                 next_step = step_num + 1
                 if next_step <= TOTAL_STEPS:
                     job["current_step"] = next_step
@@ -290,95 +293,18 @@ def job_status(job_id):
     })
 
 
-@app.route("/convert-epub/<stem>", methods=["POST"])
-@login_required
-def convert_epub(stem):
-    stem = Path(stem).name
-    if stem in active_conversions:
-        proc = active_conversions[stem]["process"]
-        if proc.poll() is None:
-            return jsonify({"status": "already_running"}), 409
-
-    pdf_path = OUTPUT_DIR / f"{stem}.pdf"
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-
-    if not pdf_path.exists():
-        return jsonify({"status": "error", "message": "PDF not found"}), 404
-    if epub_path.exists():
-        return jsonify({"status": "error", "message": "EPUB already exists"}), 409
-
-    tool = find_ebook_convert()
-    if not tool:
-        return jsonify({"status": "error", "message": "Calibre not installed"}), 500
-
-    proc = subprocess.Popen(
-        [tool, str(pdf_path), str(epub_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    active_conversions[stem] = {"process": proc, "start_time": time.time()}
-    return jsonify({"status": "started"})
-
-
-@app.route("/convert-epub-status/<stem>")
-@login_required
-def convert_epub_status(stem):
-    stem = Path(stem).name
-    if stem not in active_conversions:
-        epub_path = OUTPUT_DIR / f"{stem}.epub"
-        if epub_path.exists():
-            return jsonify({"status": "done", "elapsed": 0})
-        return jsonify({"status": "not_found"}), 404
-
-    info = active_conversions[stem]
-    proc = info["process"]
-    elapsed = round(time.time() - info["start_time"])
-
-    if proc.poll() is None:
-        return jsonify({"status": "running", "elapsed": elapsed})
-
-    del active_conversions[stem]
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-    if proc.returncode == 0 and epub_path.exists():
-        return jsonify({"status": "done", "elapsed": elapsed})
-    else:
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        return jsonify({"status": "error", "elapsed": elapsed, "message": stderr or "Conversion failed"})
-
-
-@app.route("/stop-convert/<stem>", methods=["POST"])
-@login_required
-def stop_convert(stem):
-    stem = Path(stem).name
-    if stem not in active_conversions:
-        return jsonify({"status": "not_found"}), 404
-
-    info = active_conversions[stem]
-    proc = info["process"]
-    if proc.poll() is None:
-        proc.kill()
-    del active_conversions[stem]
-
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-    if epub_path.exists():
-        epub_path.unlink()
-
-    return jsonify({"status": "stopped"})
-
-
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
-    """Download an ebook file. The file is kept in the library for later access.
-
-    BUG FIX: Do NOT delete the file after download. The old code had a
-    call_on_close that removed the file, which meant you could only download
-    once and then the book vanished from the library. Use /delete to remove.
-    """
+    """Download an EPUB file. The file is kept in the library for later access."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
         return {"error": "File not found"}, 404
+    # BUG FIX: Do NOT delete the file after download.
+    # The old code had a call_on_close that removed the EPUB + related files,
+    # which broke the library — you could only download once, then the book
+    # vanished. Users should use the explicit /delete endpoint instead.
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
 
@@ -419,7 +345,7 @@ def delete_all():
     deleted, errors = [], []
     if OUTPUT_DIR.exists():
         for f in list(OUTPUT_DIR.iterdir()):
-            if f.suffix in (".epub", ".pdf"):
+            if f.suffix == ".epub":
                 try:
                     stem = f.stem
                     f.unlink()
