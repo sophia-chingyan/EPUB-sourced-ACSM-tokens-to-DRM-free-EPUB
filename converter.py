@@ -224,37 +224,44 @@ def register_device():
 
     ADEPT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # The correct flag for anonymous activation is -a / --anonymous.
-    # Previous attempts used -r (wrong) and no-args (prints help, exits 255).
+    # Activation contacts Adobe's servers — this is a real network call and can
+    # take 30-90 seconds. stdin=subprocess.DEVNULL prevents the process from
+    # blocking waiting for keyboard input that will never arrive in a container.
+    print(f"[DEBUG] Running: {tool} -a  (ADEPT dir: {ADEPT_DIR}, writable: {os.access(ADEPT_DIR, os.W_OK)})", flush=True)
     try:
-        result = run([tool, "-a"], timeout=60)
+        result = subprocess.run(
+            [tool, "-a"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=120,   # Adobe servers can be slow; 2 min is generous but finite
+        )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Device registration timed out (60s).")
+        raise RuntimeError(
+            "Device registration timed out after 120 seconds. "
+            "Adobe's activation servers may be unreachable from this container. "
+            "Check that outbound HTTPS (port 443) is allowed."
+        )
+
+    print(f"[DEBUG] adept_activate exit={result.returncode}", flush=True)
+    print(f"[DEBUG] stdout: {result.stdout[:600]}", flush=True)
+    print(f"[DEBUG] stderr: {result.stderr[:600]}", flush=True)
 
     if result.returncode == 0 and device_file.exists():
-        print("[OK] Adobe device registered (anonymous -a).")
+        print("[OK] Adobe device registered.", flush=True)
         return
 
-    print(f"[DEBUG] adept_activate -a exit={result.returncode}")
-    print(f"[DEBUG] stdout: {result.stdout[:400]}")
-    print(f"[DEBUG] stderr: {result.stderr[:400]}")
-
-    # Fallback: some builds also accept --anonymous (long form)
-    try:
-        result = run([tool, "--anonymous"], timeout=60)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Device registration timed out (60s).")
-
-    if result.returncode == 0 and device_file.exists():
-        print("[OK] Adobe device registered (--anonymous).")
-        return
+    if result.returncode == 0 and not device_file.exists():
+        raise RuntimeError(
+            f"adept_activate exited 0 but {device_file} was not created. "
+            f"Check that {ADEPT_DIR} is writable and is not a broken symlink."
+        )
 
     raise RuntimeError(
-        f"Device registration failed.\n"
-        f"Exit code: {result.returncode}\n"
-        f"stdout: {result.stdout[:400]}\n"
-        f"stderr: {result.stderr[:400]}\n"
-        f"ADEPT dir: {ADEPT_DIR} (writable: {os.access(ADEPT_DIR, os.W_OK)})"
+        f"Device registration failed (exit {result.returncode}).\n"
+        f"stdout: {result.stdout[:600]}\n"
+        f"stderr: {result.stderr[:600]}\n"
+        f"ADEPT dir: {ADEPT_DIR}  writable={os.access(ADEPT_DIR, os.W_OK)}"
     )
 
 
