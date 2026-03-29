@@ -7,33 +7,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Clone libgourou from the canonical upstream.
-# forge.soutade.fr can be slow; we try it first, then fall back to a known
-# stable GitHub mirror. Both are checked in the same RUN layer so Docker
-# caches a successful build even if one source is down.
-#
-# FIX: removed BentonEdmondson mirror — it has a different repo structure and
-# its availability is not guaranteed. The two sources below are both the same
-# upstream codebase with the same Makefile layout.
+# Clone libgourou.
+# Primary: canonical upstream on the author's self-hosted forge.
+# Fallback: BentonEdmondson's GitHub mirror — confirmed available and has the
+#           same Makefile layout as the upstream.
+# NOTE: github.com/Soutade/libgourou does NOT exist; that was a bad fallback.
 RUN git clone --recurse-submodules \
         https://forge.soutade.fr/soutade/libgourou.git \
         /app/libgourou \
     || git clone --recurse-submodules \
-        https://github.com/Soutade/libgourou.git \
+        https://github.com/BentonEdmondson/the-one-with-libgourou-and-utilities.git \
         /app/libgourou
 
+# Build and immediately verify all three binaries exist, then install them
+# to /usr/local/bin so shutil.which() always finds them regardless of how
+# SCRIPT_DIR resolves at runtime.
 RUN cd /app/libgourou \
     && make BUILD_UTILS=1 BUILD_STATIC=1 BUILD_SHARED=0 \
-    && ls -la /app/libgourou/utils/acsmdownloader \
-    && ls -la /app/libgourou/utils/adept_activate \
-    && ls -la /app/libgourou/utils/adept_remove \
-    && cp /app/libgourou/utils/acsmdownloader /usr/local/bin/ \
-    && cp /app/libgourou/utils/adept_activate  /usr/local/bin/ \
-    && cp /app/libgourou/utils/adept_remove    /usr/local/bin/ \
-    && chmod +x /usr/local/bin/acsmdownloader /usr/local/bin/adept_activate /usr/local/bin/adept_remove
-
-# Make the utils findable via both the local path check and shutil.which
-ENV PATH="/app/libgourou/utils:/usr/local/bin:${PATH}"
+    && test -x utils/acsmdownloader \
+    && test -x utils/adept_activate \
+    && test -x utils/adept_remove \
+    && cp utils/acsmdownloader utils/adept_activate utils/adept_remove /usr/local/bin/ \
+    && echo "libgourou build OK — binaries installed to /usr/local/bin"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -41,10 +36,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py converter.py ./
 COPY templates/ templates/
 
-# /data is the persistent volume mount point (configure in Zeabur dashboard).
-# /data/adept holds Adobe device credentials — losing it means re-registration
-# on every cold start, which eventually triggers Adobe's device-limit ban.
-# Mount a volume at /data or you WILL hit that limit.
+# /data must be a persistent volume in Zeabur (dashboard → Volumes → /data).
+# /data/adept holds Adobe device credentials. Without persistence these are
+# wiped on every redeploy, causing repeated re-registration and eventual
+# Adobe device-limit bans.
 RUN mkdir -p /data/uploads /data/output /data/covers /data/adept \
     && mkdir -p /root/.config \
     && ln -s /data/adept /root/.config/adept
