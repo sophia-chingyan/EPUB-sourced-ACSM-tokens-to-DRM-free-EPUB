@@ -14,6 +14,10 @@ RUN git clone --recurse-submodules https://forge.soutade.fr/soutade/libgourou.gi
     && make BUILD_UTILS=1 BUILD_STATIC=1 BUILD_SHARED=0 \
     && ls -la /app/libgourou/utils/acsmdownloader
 
+# Set ADEPT_DIR so all libgourou tools use the same credential path.
+# This is the officially supported env var since libgourou v0.8.1.
+ENV ADEPT_DIR=/app/.adept
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
