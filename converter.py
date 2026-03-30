@@ -20,7 +20,11 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 LIBGOUROU_DIR = SCRIPT_DIR / "libgourou"
 LIBGOUROU_BIN = LIBGOUROU_DIR / "utils"
-ADEPT_DIR = Path.home() / ".config" / "adept"
+
+# Use a fixed path inside the app directory for ADEPT credentials.
+# This MUST match the --output-dir passed to adept_activate
+# and the --adept-directory passed to acsmdownloader / adept_remove.
+ADEPT_DIR = SCRIPT_DIR / ".adept"
 
 
 def run(cmd, **kwargs):
@@ -73,62 +77,148 @@ def detect_format(acsm_path):
 
 
 def register_device():
-    """Register an Adobe device (one-time setup)."""
+    """Register an Adobe device (one-time setup).
+
+    adept_activate writes credentials to the directory specified by
+    --output-dir (default: ./.adept). We use ADEPT_DIR so that all
+    tools share the same credential path.
+    """
     device_file = ADEPT_DIR / "device.xml"
     if device_file.exists():
-        print("[OK] Adobe device already registered.")
+        print("[OK] Adobe device already registered.", flush=True)
         return
 
-    print("Registering Adobe device (anonymous)...")
+    print("Registering Adobe device (anonymous)...", flush=True)
     tool = find_tool("adept_activate")
     if not tool:
         raise RuntimeError("adept_activate not found. libgourou not built.")
-    try:
-        result = run([tool, "-a"], timeout=30)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("Device registration timed out (30s).")
-    if result.returncode != 0:
-        raise RuntimeError(f"Device registration failed: {result.stdout}\n{result.stderr}")
 
-    print("[OK] Adobe device registered.")
+    # Remove any partial/stale ADEPT directory so adept_activate
+    # can create it fresh (it requires the dir to NOT exist).
+    if ADEPT_DIR.exists():
+        shutil.rmtree(ADEPT_DIR)
+
+    cmd = [
+        tool,
+        "--anonymous",
+        "--random-serial",
+        "--output-dir", str(ADEPT_DIR),
+    ]
+    print(f"[DEBUG] Running: {' '.join(cmd)}", flush=True)
+
+    try:
+        result = run(cmd, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "Device registration timed out (60s). "
+            "Adobe's activation server may be unreachable from this host."
+        )
+
+    stdout = result.stdout.strip() if result.stdout else ""
+    stderr = result.stderr.strip() if result.stderr else ""
+    print(f"[DEBUG] adept_activate exit={result.returncode}", flush=True)
+    if stdout:
+        print(f"[DEBUG] stdout: {stdout}", flush=True)
+    if stderr:
+        print(f"[DEBUG] stderr: {stderr}", flush=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Device registration failed (exit {result.returncode}): "
+            f"{stderr or stdout}"
+        )
+
+    if not device_file.exists():
+        raise RuntimeError(
+            "Device registration command succeeded but device.xml was not created. "
+            f"Check {ADEPT_DIR} for output."
+        )
+
+    print("[OK] Adobe device registered.", flush=True)
 
 
 def fulfill_acsm(acsm_path, output_path):
     """Download the DRM-protected ebook by fulfilling the ACSM token."""
-    print(f"Fulfilling ACSM: {acsm_path.name}")
+    print(f"Fulfilling ACSM: {acsm_path.name}", flush=True)
     tool = find_tool("acsmdownloader")
     if not tool:
         raise RuntimeError("acsmdownloader not found. libgourou not built.")
+
+    cmd = [
+        tool,
+        "--adept-directory", str(ADEPT_DIR),
+        "-f", str(acsm_path),
+        "-o", str(output_path),
+    ]
+    print(f"[DEBUG] Running: {' '.join(cmd)}", flush=True)
+
     try:
-        result = run([tool, "-f", str(acsm_path), "-o", str(output_path)], timeout=120)
+        result = run(cmd, timeout=120)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("Download timed out (120s). The ACSM token may be expired or the server is unreachable.")
+        raise RuntimeError(
+            "Download timed out (120s). The ACSM token may be expired "
+            "or the server is unreachable."
+        )
+
+    stdout = result.stdout.strip() if result.stdout else ""
+    stderr = result.stderr.strip() if result.stderr else ""
+    print(f"[DEBUG] acsmdownloader exit={result.returncode}", flush=True)
+    if stdout:
+        print(f"[DEBUG] stdout: {stdout}", flush=True)
+    if stderr:
+        print(f"[DEBUG] stderr: {stderr}", flush=True)
+
     if result.returncode != 0:
-        stderr = result.stderr or result.stdout or ""
-        print(f"ACSM fulfillment failed:\n{stderr}", flush=True)
-        raise RuntimeError(f"ACSM download failed (exit code {result.returncode}): {stderr[:500]}")
+        raise RuntimeError(
+            f"ACSM download failed (exit {result.returncode}): "
+            f"{(stderr or stdout)[:500]}"
+        )
 
     if not output_path.exists():
-        raise RuntimeError(f"Download completed but output file not found. stdout: {result.stdout[:200]}")
+        raise RuntimeError(
+            "Download completed but output file not found. "
+            f"stdout: {stdout[:200]}"
+        )
 
     size_kb = output_path.stat().st_size / 1024
-    print(f"[OK] Downloaded: {output_path.name} ({size_kb:.0f} KB)")
+    print(f"[OK] Downloaded: {output_path.name} ({size_kb:.0f} KB)", flush=True)
 
 
 def remove_drm(input_path, output_path):
     """Remove DRM from the downloaded ebook."""
-    print(f"Removing DRM: {input_path.name}")
+    print(f"Removing DRM: {input_path.name}", flush=True)
     tool = find_tool("adept_remove")
     if not tool:
         raise RuntimeError("adept_remove not found. libgourou not built.")
+
+    cmd = [
+        tool,
+        "--adept-directory", str(ADEPT_DIR),
+        "-f", str(input_path),
+        "-o", str(output_path),
+    ]
+    print(f"[DEBUG] Running: {' '.join(cmd)}", flush=True)
+
     try:
-        result = run([tool, "-f", str(input_path), "-o", str(output_path)], timeout=60)
+        result = run(cmd, timeout=60)
     except subprocess.TimeoutExpired:
         raise RuntimeError("DRM removal timed out (60s).")
-    if result.returncode != 0:
-        raise RuntimeError(f"DRM removal failed: {(result.stderr or result.stdout)[:300]}")
 
-    print(f"[OK] DRM removed: {output_path.name}")
+    stdout = result.stdout.strip() if result.stdout else ""
+    stderr = result.stderr.strip() if result.stderr else ""
+    print(f"[DEBUG] adept_remove exit={result.returncode}", flush=True)
+    if stdout:
+        print(f"[DEBUG] stdout: {stdout}", flush=True)
+    if stderr:
+        print(f"[DEBUG] stderr: {stderr}", flush=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"DRM removal failed (exit {result.returncode}): "
+            f"{(stderr or stdout)[:300]}"
+        )
+
+    print(f"[OK] DRM removed: {output_path.name}", flush=True)
 
 
 def convert_pipeline(acsm_path, output_dir):
