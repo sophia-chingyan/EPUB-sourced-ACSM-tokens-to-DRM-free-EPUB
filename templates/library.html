@@ -35,7 +35,6 @@
             min-height: 100vh;
         }
 
-        /* ── Header ── */
         .site-header {
             background: #1c1917;
             border-bottom: 1px solid #292524;
@@ -72,7 +71,6 @@
         .nav-link:hover { color: #fff; background: rgba(255,255,255,0.08); }
         .nav-link.active { color: #fff; background: rgba(255,255,255,0.12); }
 
-        /* ── Page layout ── */
         .page-wrap {
             max-width: 1100px;
             margin: 0 auto;
@@ -104,7 +102,6 @@
         }
         .header-actions { display: flex; align-items: center; gap: 0.75rem; }
 
-        /* ── Buttons ── */
         .btn {
             display: inline-flex;
             align-items: center;
@@ -120,49 +117,20 @@
             text-decoration: none;
             white-space: nowrap;
         }
-        .btn-primary {
-            background: var(--accent);
-            color: #fff;
-        }
+        .btn-primary { background: var(--accent); color: #fff; }
         .btn-primary:hover { background: var(--accent-hover); color: #fff; }
-        .btn-danger {
-            background: var(--red-soft);
-            color: var(--red);
-            border: 1px solid #fecaca;
-        }
+        .btn-danger { background: var(--red-soft); color: var(--red); border: 1px solid #fecaca; }
         .btn-danger:hover { background: #fee2e2; }
-        .btn-ghost {
-            background: transparent;
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-        }
+        .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
         .btn-ghost:hover { background: var(--surface-2); color: var(--text); }
         .btn-sm { padding: 0.35rem 0.75rem; font-size: 0.8rem; }
         .btn-icon { padding: 0.35rem 0.55rem; border-radius: 6px; }
 
-        /* ── Empty state ── */
-        .empty-state {
-            text-align: center;
-            padding: 5rem 2rem;
-        }
-        .empty-state .empty-icon {
-            font-size: 3.5rem;
-            margin-bottom: 1rem;
-            opacity: 0.35;
-        }
-        .empty-state h2 {
-            font-family: 'Lora', serif;
-            font-size: 1.4rem;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
-        }
-        .empty-state p {
-            color: var(--text-muted);
-            font-size: 0.9rem;
-            margin-bottom: 1.5rem;
-        }
+        .empty-state { text-align: center; padding: 5rem 2rem; }
+        .empty-state .empty-icon { font-size: 3.5rem; margin-bottom: 1rem; opacity: 0.35; }
+        .empty-state h2 { font-family: 'Lora', serif; font-size: 1.4rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+        .empty-state p { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
 
-        /* ── Book table ── */
         .table-wrap {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -189,12 +157,7 @@
             color: var(--text-muted);
             cursor: pointer;
         }
-        .select-all-wrap input[type="checkbox"] {
-            width: 15px;
-            height: 15px;
-            cursor: pointer;
-            accent-color: var(--accent);
-        }
+        .select-all-wrap input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
         .selection-info {
             font-size: 0.82rem;
             color: var(--text-muted);
@@ -203,17 +166,10 @@
             border: 1px solid var(--border);
             border-radius: 20px;
         }
-        .selection-info.has-selection {
-            color: var(--accent);
-            border-color: #fed7aa;
-            background: var(--accent-soft);
-        }
+        .selection-info.has-selection { color: var(--accent); border-color: #fed7aa; background: var(--accent-soft); }
 
         .book-table { width: 100%; border-collapse: collapse; }
-        .book-table thead {
-            background: var(--surface-2);
-            border-bottom: 1px solid var(--border);
-        }
+        .book-table thead { background: var(--surface-2); border-bottom: 1px solid var(--border); }
         .book-table th {
             padding: 0.6rem 1rem;
             font-size: 0.75rem;
@@ -226,159 +182,65 @@
         .book-table th:first-child { width: 40px; padding-left: 1.25rem; }
         .book-table th:last-child { text-align: right; padding-right: 1.25rem; }
 
-        .book-row {
-            border-bottom: 1px solid var(--border);
-            transition: background 0.12s;
-        }
+        .book-row { border-bottom: 1px solid var(--border); transition: background 0.12s; }
         .book-row:last-child { border-bottom: none; }
         .book-row:hover { background: #faf9f7; }
         .book-row.selected { background: var(--accent-soft); }
-        .book-row.removing {
-            opacity: 0;
-            transform: translateX(12px);
-            transition: opacity 0.3s ease, transform 0.3s ease;
-        }
+        .book-row.removing { opacity: 0; transform: translateX(12px); transition: opacity 0.3s ease, transform 0.3s ease; }
 
-        .book-table td {
-            padding: 0.85rem 1rem;
-            vertical-align: middle;
-        }
+        .book-table td { padding: 0.85rem 1rem; vertical-align: middle; }
         .book-table td:first-child { padding-left: 1.25rem; }
         .book-table td:last-child { text-align: right; padding-right: 1.25rem; }
 
-        td input[type="checkbox"] {
-            width: 15px;
-            height: 15px;
-            cursor: pointer;
-            accent-color: var(--accent);
-        }
+        td input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; accent-color: var(--accent); }
 
         .book-meta { display: flex; align-items: center; gap: 0.9rem; }
         .book-thumb {
-            width: 38px;
-            height: 52px;
-            border-radius: 4px;
-            object-fit: cover;
-            flex-shrink: 0;
-            box-shadow: 0 1px 4px rgba(0,0,0,0.15);
-            border: 1px solid var(--border);
+            width: 38px; height: 52px; border-radius: 4px; object-fit: cover; flex-shrink: 0;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.15); border: 1px solid var(--border);
         }
         .book-thumb-placeholder {
-            width: 38px;
-            height: 52px;
-            border-radius: 4px;
+            width: 38px; height: 52px; border-radius: 4px;
             background: linear-gradient(135deg, #e7e5e0, #d6d3cd);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.1rem;
-            flex-shrink: 0;
-            border: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.1rem; flex-shrink: 0; border: 1px solid var(--border);
         }
-        .book-name {
-            font-weight: 600;
-            font-size: 0.9rem;
-            color: var(--text);
-            line-height: 1.3;
-            word-break: break-word;
-        }
-        .book-filename {
-            font-size: 0.78rem;
-            color: var(--text-muted);
-            margin-top: 0.15rem;
-        }
+        .book-name { font-weight: 600; font-size: 0.9rem; color: var(--text); line-height: 1.3; word-break: break-word; }
+        .book-filename { font-size: 0.78rem; color: var(--text-muted); margin-top: 0.15rem; }
 
-        .badge {
-            display: inline-block;
-            padding: 0.15rem 0.55rem;
-            border-radius: 4px;
-            font-size: 0.72rem;
-            font-weight: 700;
-            letter-spacing: 0.04em;
-        }
-        .badge-epub {
-            background: #dcfce7;
-            color: #15803d;
-        }
+        .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 4px; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; }
+        .badge-epub { background: #dcfce7; color: #15803d; }
 
         .file-size { font-size: 0.85rem; color: var(--text-muted); }
 
         .row-actions { display: flex; align-items: center; gap: 0.4rem; justify-content: flex-end; }
 
-        /* ── Toast ── */
-        #toast-container {
-            position: fixed;
-            bottom: 1.5rem;
-            right: 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-            z-index: 9999;
-        }
+        #toast-container { position: fixed; bottom: 1.5rem; right: 1.5rem; display: flex; flex-direction: column; gap: 0.5rem; z-index: 9999; }
         .toast {
-            display: flex;
-            align-items: center;
-            gap: 0.6rem;
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            font-size: 0.875rem;
-            font-weight: 500;
-            box-shadow: var(--shadow-md);
-            animation: slideUp 0.25s ease;
-            max-width: 320px;
+            display: flex; align-items: center; gap: 0.6rem; padding: 0.75rem 1rem; border-radius: 8px;
+            font-size: 0.875rem; font-weight: 500; box-shadow: var(--shadow-md);
+            animation: slideUp 0.25s ease; max-width: 320px;
         }
         .toast-success { background: #1c1917; color: #fff; }
         .toast-error { background: var(--red); color: #fff; }
-        @keyframes slideUp {
-            from { opacity: 0; transform: translateY(10px); }
-            to   { opacity: 1; transform: translateY(0); }
-        }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-        /* ── Confirm modal ── */
-        .modal-backdrop {
-            display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.45);
-            z-index: 500;
-            align-items: center;
-            justify-content: center;
-        }
+        .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 500; align-items: center; justify-content: center; }
         .modal-backdrop.open { display: flex; }
         .modal {
-            background: var(--surface);
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.25);
-            padding: 2rem;
-            width: 100%;
-            max-width: 400px;
-            animation: popIn 0.2s ease;
+            background: var(--surface); border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+            padding: 2rem; width: 100%; max-width: 400px; animation: popIn 0.2s ease;
         }
-        @keyframes popIn {
-            from { opacity: 0; transform: scale(0.95); }
-            to   { opacity: 1; transform: scale(1); }
-        }
-        .modal h3 {
-            font-family: 'Lora', serif;
-            font-size: 1.2rem;
-            margin-bottom: 0.6rem;
-            color: var(--text);
-        }
-        .modal p {
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            margin-bottom: 1.5rem;
-            line-height: 1.5;
-        }
+        @keyframes popIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+        .modal h3 { font-family: 'Lora', serif; font-size: 1.2rem; margin-bottom: 0.6rem; color: var(--text); }
+        .modal p { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 1.5rem; line-height: 1.5; }
         .modal p strong { color: var(--text); }
         .modal-actions { display: flex; gap: 0.75rem; justify-content: flex-end; }
 
         @media (max-width: 640px) {
             .page-header { flex-direction: column; align-items: flex-start; }
-            .book-table th:nth-child(3),
-            .book-table td:nth-child(3) { display: none; }
-            .book-table th:nth-child(4),
-            .book-table td:nth-child(4) { display: none; }
+            .book-table th:nth-child(3), .book-table td:nth-child(3) { display: none; }
+            .book-table th:nth-child(4), .book-table td:nth-child(4) { display: none; }
             .site-header { padding: 0 1rem; }
             .page-wrap { padding: 1.5rem 1rem 3rem; }
         }
@@ -493,7 +355,6 @@
         {% endif %}
     </div>
 
-    <!-- Confirm modal -->
     <div class="modal-backdrop" id="modal-backdrop">
         <div class="modal">
             <h3 id="modal-title">Delete file?</h3>
@@ -505,20 +366,16 @@
         </div>
     </div>
 
-    <!-- Toast container -->
     <div id="toast-container"></div>
 
     <script>
         let modalAction = null;
 
-        // ── Checkbox logic ──────────────────────────────────────────
         const selectAll = document.getElementById('select-all');
         const selectionInfo = document.getElementById('selection-info');
         const btnDeleteSelected = document.getElementById('btn-delete-selected');
 
-        function getChecked() {
-            return [...document.querySelectorAll('.row-checkbox:checked')];
-        }
+        function getChecked() { return [...document.querySelectorAll('.row-checkbox:checked')]; }
 
         function updateSelectionUI() {
             const checked = getChecked();
@@ -526,11 +383,9 @@
             selectionInfo.textContent = count + ' selected';
             selectionInfo.classList.toggle('has-selection', count > 0);
             btnDeleteSelected.style.display = count > 0 ? 'inline-flex' : 'none';
-
             const allBoxes = document.querySelectorAll('.row-checkbox');
             selectAll.indeterminate = count > 0 && count < allBoxes.length;
             selectAll.checked = count > 0 && count === allBoxes.length;
-
             document.querySelectorAll('.book-row').forEach(row => {
                 const cb = row.querySelector('.row-checkbox');
                 row.classList.toggle('selected', cb && cb.checked);
@@ -543,36 +398,21 @@
 
         if (selectAll) {
             selectAll.addEventListener('change', () => {
-                document.querySelectorAll('.row-checkbox').forEach(cb => {
-                    cb.checked = selectAll.checked;
-                });
+                document.querySelectorAll('.row-checkbox').forEach(cb => { cb.checked = selectAll.checked; });
                 updateSelectionUI();
             });
         }
 
-        // ── Modal ────────────────────────────────────────────────────
         function openModal(title, body, action) {
             document.getElementById('modal-title').textContent = title;
             document.getElementById('modal-body').innerHTML = body;
             modalAction = action;
             document.getElementById('modal-backdrop').classList.add('open');
         }
+        function closeModal() { document.getElementById('modal-backdrop').classList.remove('open'); modalAction = null; }
+        function modalConfirm() { closeModal(); if (modalAction) modalAction(); }
+        document.getElementById('modal-backdrop').addEventListener('click', e => { if (e.target === e.currentTarget) closeModal(); });
 
-        function closeModal() {
-            document.getElementById('modal-backdrop').classList.remove('open');
-            modalAction = null;
-        }
-
-        function modalConfirm() {
-            closeModal();
-            if (modalAction) modalAction();
-        }
-
-        document.getElementById('modal-backdrop').addEventListener('click', e => {
-            if (e.target === e.currentTarget) closeModal();
-        });
-
-        // ── Toast ────────────────────────────────────────────────────
         function showToast(message, type = 'success') {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
@@ -582,37 +422,24 @@
             setTimeout(() => toast.remove(), 3500);
         }
 
-        // ── Delete one ───────────────────────────────────────────────
         function confirmDeleteOne(filename, stem) {
-            openModal(
-                'Delete this book?',
-                `<strong>${stem}</strong> will be permanently removed.`,
-                () => deleteFiles([filename])
-            );
+            openModal('Delete this book?', `<strong>${stem}</strong> will be permanently removed.`, () => deleteFiles([filename]));
         }
 
-        // ── Delete selected ──────────────────────────────────────────
         function deleteSelected() {
             const checked = getChecked();
             if (!checked.length) return;
             const filenames = checked.map(cb => cb.value);
             const noun = filenames.length === 1 ? '1 book' : filenames.length + ' books';
-            openModal(
-                'Delete selected?',
-                `<strong>${noun}</strong> will be permanently removed.`,
-                () => deleteFiles(filenames)
-            );
+            openModal('Delete selected?', `<strong>${noun}</strong> will be permanently removed.`, () => deleteFiles(filenames));
         }
 
-        // ── Delete all ───────────────────────────────────────────────
         function confirmDeleteAll() {
             const rows = document.querySelectorAll('.book-row');
             if (!rows.length) return;
-            openModal(
-                'Delete all books?',
-                `All <strong>${rows.length}</strong> book${rows.length !== 1 ? 's' : ''} in your library will be permanently removed. This cannot be undone.`,
-                () => deleteAllFiles()
-            );
+            openModal('Delete all books?',
+                `All <strong>${rows.length}</strong> book${rows.length !== 1 ? 's' : ''} in your library will be permanently removed.`,
+                () => deleteAllFiles());
         }
 
         async function deleteAllFiles() {
@@ -627,16 +454,11 @@
                 setTimeout(updateBookCount, 350);
                 showToast(`Deleted ${deleted.length} book${deleted.length !== 1 ? 's' : ''}`);
                 updateSelectionUI();
-            } catch (err) {
-                showToast('Delete failed: ' + err.message, 'error');
-            }
+            } catch (err) { showToast('Delete failed: ' + err.message, 'error'); }
         }
 
-        // ── Core delete ──────────────────────────────────────────────
         async function deleteFiles(filenames) {
-            let successCount = 0;
-            let failCount = 0;
-
+            let successCount = 0, failCount = 0;
             await Promise.all(filenames.map(async filename => {
                 try {
                     const resp = await fetch('/delete/' + encodeURIComponent(filename), { method: 'POST' });
@@ -645,31 +467,22 @@
                         const row = document.querySelector(`.book-row[data-filename="${CSS.escape(filename)}"]`);
                         if (row) animateRemove(row);
                         successCount++;
-                    } else {
-                        failCount++;
-                    }
-                } catch {
-                    failCount++;
-                }
+                    } else { failCount++; }
+                } catch { failCount++; }
             }));
-
             setTimeout(updateBookCount, 350);
             if (successCount) showToast(`Deleted ${successCount} book${successCount !== 1 ? 's' : ''}`);
             if (failCount) showToast(`${failCount} deletion${failCount !== 1 ? 's' : ''} failed`, 'error');
             updateSelectionUI();
         }
 
-        function animateRemove(row) {
-            row.classList.add('removing');
-            setTimeout(() => row.remove(), 300);
-        }
+        function animateRemove(row) { row.classList.add('removing'); setTimeout(() => row.remove(), 300); }
 
         function updateBookCount() {
             const remaining = document.querySelectorAll('.book-row').length;
             const countEl = document.getElementById('book-count');
             if (countEl) {
                 if (remaining === 0) {
-                    // Replace table with empty state
                     document.querySelector('.table-wrap').remove();
                     const wrap = document.querySelector('.page-wrap');
                     const emptyDiv = document.createElement('div');
@@ -678,8 +491,7 @@
                         <div class="empty-icon">📚</div>
                         <h2>No books yet</h2>
                         <p>Convert an ACSM file to get started. Your books will appear here.</p>
-                        <a href="/" class="btn btn-primary">Convert a file</a>
-                    `;
+                        <a href="/" class="btn btn-primary">Convert a file</a>`;
                     wrap.appendChild(emptyDiv);
                     countEl.textContent = '';
                 } else {
