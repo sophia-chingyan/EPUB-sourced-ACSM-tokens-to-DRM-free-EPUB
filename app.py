@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Flask web interface for the ACSM converter."""
 
-import json
 import os
-import subprocess
 import threading
 import time
+import traceback
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, make_response, render_template, request, send_from_directory, session, redirect, url_for
+from flask import (
+    Flask, jsonify, make_response, render_template,
+    request, send_from_directory, session, redirect, url_for,
+)
 
-from converter import convert_pipeline, find_ebook_convert
+from converter import convert_pipeline
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -38,10 +40,11 @@ STEP_LABELS = {
     5: "Removing DRM...",
 }
 
-# Track active conversions: job_id -> {steps: [...], status, error}
+# Track active conversions: job_id -> {steps, status, error, ...}
 active_jobs = {}
-# Track active EPUB conversions
-active_conversions = {}
+
+
+# ─── Auth ────────────────────────────────────────────────────────────────
 
 
 def login_required(f):
@@ -71,6 +74,9 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+# ─── Cover extraction ───────────────────────────────────────────────────
 
 
 def extract_epub_cover(epub_path):
@@ -134,42 +140,45 @@ def _find_cover_by_name(zf):
     return None
 
 
+# ─── Book listing ────────────────────────────────────────────────────────
+
+
 def get_books():
     if not OUTPUT_DIR.exists():
         return []
     books = OrderedDict()
     for f in sorted(OUTPUT_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if f.suffix in (".pdf", ".epub"):
+        if f.suffix == ".epub":
             stem = f.stem
             if stem not in books:
-                books[stem] = {"stem": stem, "files": [], "cover": None, "has_epub": False}
+                books[stem] = {"stem": stem, "files": [], "cover": None}
             size_mb = f.stat().st_size / (1024 * 1024)
             books[stem]["files"].append({
                 "name": f.name,
                 "size": f"{size_mb:.1f} MB",
                 "ext": f.suffix[1:].upper(),
             })
-            if f.suffix == ".epub":
-                books[stem]["has_epub"] = True
-                if not books[stem]["cover"]:
-                    cover = extract_epub_cover(f)
-                    if cover:
-                        books[stem]["cover"] = cover
+            if not books[stem]["cover"]:
+                cover = extract_epub_cover(f)
+                if cover:
+                    books[stem]["cover"] = cover
     return list(books.values())
+
+
+# ─── Background conversion ──────────────────────────────────────────────
 
 
 def run_conversion_job(job_id, acsm_path, output_dir):
     """Run conversion in a background thread, updating active_jobs."""
-    import traceback
     job = active_jobs[job_id]
     total = 5
-    print(f"[DEBUG] Job {job_id} started: acsm={acsm_path}, output={output_dir}", flush=True)
+    print(f"[JOB] {job_id} started: acsm={acsm_path}", flush=True)
     try:
         job["current_step"] = 1
         job["current_label"] = STEP_LABELS[1]
 
         for step, message in convert_pipeline(str(acsm_path), str(output_dir)):
-            print(f"[DEBUG] Job {job_id} step={step} message={message}", flush=True)
+            print(f"[JOB] {job_id} step={step} msg={message}", flush=True)
             if step == "done":
                 job["steps"].append({"step": "done", "message": message})
                 job["status"] = "done"
@@ -182,13 +191,16 @@ def run_conversion_job(job_id, acsm_path, output_dir):
                     job["current_step"] = next_step
                     job["current_label"] = STEP_LABELS[next_step]
     except RuntimeError as e:
-        print(f"[DEBUG] Job {job_id} RuntimeError: {e}", flush=True)
+        print(f"[JOB] {job_id} error: {e}", flush=True)
         job["status"] = "error"
         job["error"] = str(e)
     except Exception as e:
-        print(f"[DEBUG] Job {job_id} Exception: {e}\n{traceback.format_exc()}", flush=True)
+        print(f"[JOB] {job_id} unexpected: {e}\n{traceback.format_exc()}", flush=True)
         job["status"] = "error"
         job["error"] = f"Unexpected error: {e}"
+
+
+# ─── Routes ──────────────────────────────────────────────────────────────
 
 
 @app.route("/")
@@ -200,18 +212,27 @@ def index():
     return resp
 
 
+@app.route("/library")
+@login_required
+def library():
+    books = get_books()
+    resp = make_response(render_template("library.html", books=books))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload():
     file = request.files.get("file")
     if not file or not file.filename:
-        return {"error": "No file provided"}, 400
+        return jsonify({"error": "No file provided"}), 400
     if not file.filename.endswith(".acsm"):
-        return {"error": "Only .acsm files are accepted"}, 400
+        return jsonify({"error": "Only .acsm files are accepted"}), 400
     filename = Path(file.filename).name
     save_path = UPLOAD_DIR / filename
     file.save(save_path)
-    return {"filename": filename}
+    return jsonify({"filename": filename})
 
 
 @app.route("/start-convert/<filename>", methods=["POST"])
@@ -267,107 +288,69 @@ def job_status(job_id):
     })
 
 
-@app.route("/convert-epub/<stem>", methods=["POST"])
-@login_required
-def convert_epub(stem):
-    stem = Path(stem).name
-    if stem in active_conversions:
-        proc = active_conversions[stem]["process"]
-        if proc.poll() is None:
-            return jsonify({"status": "already_running"}), 409
-
-    pdf_path = OUTPUT_DIR / f"{stem}.pdf"
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-
-    if not pdf_path.exists():
-        return jsonify({"status": "error", "message": "PDF not found"}), 404
-    if epub_path.exists():
-        return jsonify({"status": "error", "message": "EPUB already exists"}), 409
-
-    tool = find_ebook_convert()
-    if not tool:
-        return jsonify({"status": "error", "message": "Calibre not installed"}), 500
-
-    proc = subprocess.Popen(
-        [tool, str(pdf_path), str(epub_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    active_conversions[stem] = {"process": proc, "start_time": time.time()}
-    return jsonify({"status": "started"})
-
-
-@app.route("/convert-epub-status/<stem>")
-@login_required
-def convert_epub_status(stem):
-    stem = Path(stem).name
-    if stem not in active_conversions:
-        epub_path = OUTPUT_DIR / f"{stem}.epub"
-        if epub_path.exists():
-            return jsonify({"status": "done", "elapsed": 0})
-        return jsonify({"status": "not_found"}), 404
-
-    info = active_conversions[stem]
-    proc = info["process"]
-    elapsed = round(time.time() - info["start_time"])
-
-    if proc.poll() is None:
-        return jsonify({"status": "running", "elapsed": elapsed})
-
-    del active_conversions[stem]
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-    if proc.returncode == 0 and epub_path.exists():
-        return jsonify({"status": "done", "elapsed": elapsed})
-    else:
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        return jsonify({"status": "error", "elapsed": elapsed, "message": stderr or "Conversion failed"})
-
-
-@app.route("/stop-convert/<stem>", methods=["POST"])
-@login_required
-def stop_convert(stem):
-    stem = Path(stem).name
-    if stem not in active_conversions:
-        return jsonify({"status": "not_found"}), 404
-
-    info = active_conversions[stem]
-    proc = info["process"]
-    if proc.poll() is None:
-        proc.kill()
-    del active_conversions[stem]
-
-    epub_path = OUTPUT_DIR / f"{stem}.epub"
-    if epub_path.exists():
-        epub_path.unlink()
-
-    return jsonify({"status": "stopped"})
-
-
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
+    """Download a converted file (does NOT delete it)."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
-        return {"error": "File not found"}, 404
-    resp = send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
+        return jsonify({"error": "File not found"}), 404
+    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
 
-    @resp.call_on_close
-    def cleanup():
-        stem = Path(filename).stem
-        try:
-            file_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        for d in (UPLOAD_DIR, COVER_DIR):
-            for f in d.iterdir():
-                if f.stem == stem or f.stem.startswith(stem):
-                    try:
-                        f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
 
-    return resp
+@app.route("/delete/<filename>", methods=["POST"])
+@login_required
+def delete_file(filename):
+    """Delete a single file and its associated uploads/covers."""
+    filename = Path(filename).name
+    file_path = OUTPUT_DIR / filename
+    if not file_path.exists():
+        return jsonify({"error": "File not found"}), 404
+
+    stem = file_path.stem
+    try:
+        file_path.unlink()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Clean up related files in uploads and covers
+    for d in (UPLOAD_DIR, COVER_DIR):
+        for f in d.iterdir():
+            if f.stem == stem or f.stem.startswith(stem):
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    return jsonify({"status": "deleted", "filename": filename})
+
+
+@app.route("/delete-all", methods=["POST"])
+@login_required
+def delete_all():
+    """Delete all converted files, uploads, and covers."""
+    deleted = []
+
+    # Delete output files
+    for f in OUTPUT_DIR.iterdir():
+        if f.suffix == ".epub":
+            try:
+                name = f.name
+                f.unlink()
+                deleted.append(name)
+            except Exception:
+                pass
+
+    # Clean uploads and covers
+    for d in (UPLOAD_DIR, COVER_DIR):
+        for f in d.iterdir():
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    return jsonify({"status": "deleted", "deleted": deleted})
 
 
 @app.route("/cover/<filename>")
@@ -397,7 +380,6 @@ def debug_status():
         "active_jobs": jobs_summary,
         "upload_files": upload_files,
         "output_files": output_files,
-        "acsmdownloader_found": shutil.which("acsmdownloader") or str(Path("libgourou/utils/acsmdownloader")),
         "libgourou_exists": (SCRIPT_DIR / "libgourou" / "utils" / "acsmdownloader").exists(),
     })
 
