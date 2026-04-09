@@ -61,6 +61,7 @@ def login_required(f):
 
 
 @app.route("/setup")
+@login_required
 def setup():
     """Show QR code for Google Authenticator setup.
     Visit once to scan, then you can restrict or remove this route."""
