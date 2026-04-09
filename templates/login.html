@@ -16,22 +16,53 @@
             max-width: 380px;
             text-align: center;
         }
+        .login-card .icon { font-size: 2.5rem; margin-bottom: 0.5rem; }
         .login-card h2 { margin-bottom: 0.25rem; }
-        .login-card p { color: #78909c; margin-bottom: 1.5rem; }
-        .error { color: #c62828; font-size: 0.9rem; margin-bottom: 1rem; }
+        .login-card p { color: #78909c; margin-bottom: 1.5rem; font-size: 0.9rem; }
+        .error {
+            color: #c62828;
+            background: #ffebee;
+            border-radius: 6px;
+            padding: 0.5rem 0.75rem;
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+        }
+        input[type="text"] {
+            text-align: center;
+            font-size: 1.6rem;
+            letter-spacing: 0.3em;
+            font-weight: 600;
+        }
+        .hint {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            color: #b0bec5;
+        }
     </style>
 </head>
 <body>
     <div class="login-card">
+        <div class="icon">🔐</div>
         <h2>ACSM Converter</h2>
-        <p>Enter password to continue</p>
+        <p>Enter the 6-digit code from<br>Google Authenticator</p>
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
         <form method="POST">
-            <input type="password" name="password" placeholder="Password" required autofocus>
-            <button type="submit">Login</button>
+            <input
+                type="text"
+                name="code"
+                placeholder="000000"
+                inputmode="numeric"
+                pattern="[0-9]{6}"
+                maxlength="6"
+                autocomplete="one-time-code"
+                required
+                autofocus
+            >
+            <button type="submit">Verify</button>
         </form>
+        <p class="hint">Code refreshes every 30 seconds</p>
     </div>
 </body>
 </html>
