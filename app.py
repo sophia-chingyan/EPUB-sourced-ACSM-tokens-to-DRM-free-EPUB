@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Flask web interface for the ACSM converter."""
 
+import base64
+import io
 import os
 import threading
 import time
@@ -11,6 +13,8 @@ from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 
+import pyotp
+import qrcode
 from flask import (
     Flask, jsonify, make_response, render_template,
     request, send_from_directory, session, redirect, url_for,
@@ -21,7 +25,7 @@ from converter import convert_pipeline
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = SCRIPT_DIR / "uploads"
@@ -50,23 +54,56 @@ active_jobs = {}
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if APP_PASSWORD and not session.get("authenticated"):
+        if not session.get("authenticated"):
             return redirect(url_for("login"))
         return f(*args, **kwargs)
     return decorated
 
 
+@app.route("/setup")
+def setup():
+    """Show QR code for Google Authenticator setup.
+    Visit once to scan, then you can restrict or remove this route."""
+    if not TOTP_SECRET:
+        return (
+            "<h2>TOTP_SECRET not set</h2>"
+            "<p>Add a <code>TOTP_SECRET</code> environment variable in Zeabur first.</p>"
+            "<p>Generate one with: <code>python3 -c \"import pyotp; print(pyotp.random_base32())\"</code></p>"
+        ), 400
+
+    totp = pyotp.TOTP(TOTP_SECRET)
+    uri = totp.provisioning_uri(name="ACSM Converter", issuer_name="ACSM Converter")
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"""
+    <html><body style="font-family:sans-serif;max-width:400px;margin:4rem auto;text-align:center">
+    <h2>Scan with Google Authenticator</h2>
+    <img src="data:image/png;base64,{b64}" style="width:260px;height:260px">
+    <p style="color:#555">Or enter manually:</p>
+    <code style="font-size:1.1rem;letter-spacing:0.15em">{TOTP_SECRET}</code>
+    <p style="margin-top:2rem;color:#888;font-size:0.85rem">
+        After scanning, remove or protect this <code>/setup</code> route.
+    </p>
+    </body></html>
+    """
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if not APP_PASSWORD:
+    if not TOTP_SECRET:
+        # No secret configured — auto-authenticate (dev mode)
         session["authenticated"] = True
         return redirect(url_for("index"))
     error = None
     if request.method == "POST":
-        if request.form.get("password") == APP_PASSWORD:
+        code = request.form.get("code", "").strip()
+        totp = pyotp.TOTP(TOTP_SECRET)
+        if totp.verify(code, valid_window=1):
             session["authenticated"] = True
             return redirect(url_for("index"))
-        error = "Wrong password"
+        error = "Invalid code. Please try again."
     return render_template("login.html", error=error)
 
 
@@ -314,7 +351,6 @@ def delete_file(filename):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Clean up related files in uploads and covers
     for d in (UPLOAD_DIR, COVER_DIR):
         for f in d.iterdir():
             if f.stem == stem or f.stem.startswith(stem):
@@ -332,7 +368,6 @@ def delete_all():
     """Delete all converted files, uploads, and covers."""
     deleted = []
 
-    # Delete output files
     for f in OUTPUT_DIR.iterdir():
         if f.suffix == ".epub":
             try:
@@ -342,7 +377,6 @@ def delete_all():
             except Exception:
                 pass
 
-    # Clean uploads and covers
     for d in (UPLOAD_DIR, COVER_DIR):
         for f in d.iterdir():
             try:
@@ -364,7 +398,6 @@ def cover(filename):
 @login_required
 def debug_status():
     """Debug endpoint to check server state."""
-    import shutil
     jobs_summary = {}
     for jid, job in active_jobs.items():
         jobs_summary[jid] = {
