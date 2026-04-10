@@ -4,26 +4,20 @@ A web app to convert Adobe ACSM ebook tokens to DRM-free EPUB files.
 
 ## Authentication
 
-This app uses **TOTP (Time-based One-Time Password)** — compatible with Google Authenticator, Authy, 1Password, etc.
+This app uses **Google OAuth2**. Only the email address set in `ALLOWED_EMAIL` can log in.
 
-### First-time setup
+## Environment variables (set in Zeabur)
 
-1. **Generate a secret** (run once locally):
-   ```bash
-   python3 -c "import pyotp; print(pyotp.random_base32())"
-   ```
+| Variable | Description |
+|---|---|
+| `GOOGLE_CLIENT_ID` | From Google Cloud Console |
+| `GOOGLE_CLIENT_SECRET` | From Google Cloud Console |
+| `ALLOWED_EMAIL` | Your Google account email — only this address can log in |
+| `SECRET_KEY` | Random string for Flask sessions |
 
-2. **Set environment variables** in Zeabur (or your host):
-   - `TOTP_SECRET` — the base32 string generated above
-   - `SECRET_KEY` — a long random string for Flask sessions:
-     ```bash
-     python3 -c "import secrets; print(secrets.token_hex(32))"
-     ```
+## Google OAuth2 setup
 
-3. **Scan the QR code** — visit `/setup` on your deployed app and scan with Google Authenticator.
-
-4. After scanning, you can restrict access to `/setup` or leave it (it only shows setup info, no actions).
-
-### Logging in
-
-Open Google Authenticator, find "ACSM Converter", and enter the current 6-digit code.
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. Create a project → APIs & Services → Credentials → OAuth 2.0 Client ID
+3. Add authorised redirect URI: `https://YOUR-DOMAIN.zeabur.app/auth/callback`
+4. Copy Client ID and Client Secret into Zeabur variables

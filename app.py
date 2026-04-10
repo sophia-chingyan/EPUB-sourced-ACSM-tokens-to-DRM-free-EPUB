@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Flask web interface for the ACSM converter."""
 
-import base64
-import io
 import os
 import threading
 import time
@@ -13,8 +11,7 @@ from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
 
-import pyotp
-import qrcode
+from authlib.integrations.flask_client import OAuth
 from flask import (
     Flask, jsonify, make_response, render_template,
     request, send_from_directory, session, redirect, url_for,
@@ -25,12 +22,14 @@ from converter import convert_pipeline
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+ALLOWED_EMAIL        = os.environ.get("ALLOWED_EMAIL", "")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = SCRIPT_DIR / "uploads"
 OUTPUT_DIR = SCRIPT_DIR / "output"
-COVER_DIR = SCRIPT_DIR / "covers"
+COVER_DIR  = SCRIPT_DIR / "covers"
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -44,12 +43,20 @@ STEP_LABELS = {
     5: "Removing DRM...",
 }
 
-# Track active conversions: job_id -> {steps, status, error, ...}
 active_jobs = {}
 
+# ─── OAuth setup ─────────────────────────────────────────────────────────
+
+oauth = OAuth(app)
+oauth.register(
+    name="google",
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
 
 # ─── Auth ────────────────────────────────────────────────────────────────
-
 
 def login_required(f):
     @wraps(f)
@@ -60,52 +67,30 @@ def login_required(f):
     return decorated
 
 
-@app.route("/setup")
-@login_required
-def setup():
-    """Show QR code for Google Authenticator setup.
-    Visit once to scan, then you can restrict or remove this route."""
-    if not TOTP_SECRET:
-        return (
-            "<h2>TOTP_SECRET not set</h2>"
-            "<p>Add a <code>TOTP_SECRET</code> environment variable in Zeabur first.</p>"
-            "<p>Generate one with: <code>python3 -c \"import pyotp; print(pyotp.random_base32())\"</code></p>"
-        ), 400
-
-    totp = pyotp.TOTP(TOTP_SECRET)
-    uri = totp.provisioning_uri(name="ACSM Converter", issuer_name="ACSM Converter")
-    img = qrcode.make(uri)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"""
-    <html><body style="font-family:sans-serif;max-width:400px;margin:4rem auto;text-align:center">
-    <h2>Scan with Google Authenticator</h2>
-    <img src="data:image/png;base64,{b64}" style="width:260px;height:260px">
-    <p style="color:#555">Or enter manually:</p>
-    <code style="font-size:1.1rem;letter-spacing:0.15em">{TOTP_SECRET}</code>
-    <p style="margin-top:2rem;color:#888;font-size:0.85rem">
-        After scanning, remove or protect this <code>/setup</code> route.
-    </p>
-    </body></html>
-    """
-
-
-@app.route("/login", methods=["GET", "POST"])
+@app.route("/login")
 def login():
-    if not TOTP_SECRET:
-        # No secret configured — auto-authenticate (dev mode)
-        session["authenticated"] = True
-        return redirect(url_for("index"))
-    error = None
-    if request.method == "POST":
-        code = request.form.get("code", "").strip()
-        totp = pyotp.TOTP(TOTP_SECRET)
-        if totp.verify(code, valid_window=1):
-            session["authenticated"] = True
-            return redirect(url_for("index"))
-        error = "Invalid code. Please try again."
-    return render_template("login.html", error=error)
+    redirect_uri = url_for("auth_callback", _external=True)
+    return oauth.google.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    token = oauth.google.authorize_access_token()
+    user_info = token.get("userinfo")
+    if not user_info:
+        return render_template("login_error.html",
+                               error="Could not retrieve user info from Google."), 403
+
+    email = user_info.get("email", "")
+    if ALLOWED_EMAIL and email.lower() != ALLOWED_EMAIL.lower():
+        return render_template("login_error.html",
+                               error=f"Access denied for {email}."), 403
+
+    session["authenticated"] = True
+    session["user_email"] = email
+    session["user_name"] = user_info.get("name", email)
+    session["user_picture"] = user_info.get("picture", "")
+    return redirect(url_for("index"))
 
 
 @app.route("/logout")
@@ -115,7 +100,6 @@ def logout():
 
 
 # ─── Cover extraction ───────────────────────────────────────────────────
-
 
 def extract_epub_cover(epub_path):
     cover_out = COVER_DIR / f"{epub_path.stem}.jpg"
@@ -180,7 +164,6 @@ def _find_cover_by_name(zf):
 
 # ─── Book listing ────────────────────────────────────────────────────────
 
-
 def get_books():
     if not OUTPUT_DIR.exists():
         return []
@@ -205,9 +188,7 @@ def get_books():
 
 # ─── Background conversion ──────────────────────────────────────────────
 
-
 def run_conversion_job(job_id, acsm_path, output_dir):
-    """Run conversion in a background thread, updating active_jobs."""
     job = active_jobs[job_id]
     total = 5
     print(f"[JOB] {job_id} started: acsm={acsm_path}", flush=True)
@@ -240,12 +221,13 @@ def run_conversion_job(job_id, acsm_path, output_dir):
 
 # ─── Routes ──────────────────────────────────────────────────────────────
 
-
 @app.route("/")
 @login_required
 def index():
     books = get_books()
-    resp = make_response(render_template("index.html", books=books))
+    resp = make_response(render_template("index.html", books=books,
+                                         user_name=session.get("user_name", ""),
+                                         user_picture=session.get("user_picture", "")))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
@@ -254,7 +236,9 @@ def index():
 @login_required
 def library():
     books = get_books()
-    resp = make_response(render_template("library.html", books=books))
+    resp = make_response(render_template("library.html", books=books,
+                                          user_name=session.get("user_name", ""),
+                                          user_picture=session.get("user_picture", "")))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
@@ -276,7 +260,6 @@ def upload():
 @app.route("/start-convert/<filename>", methods=["POST"])
 @login_required
 def start_convert(filename):
-    """Start conversion in background, return a job ID for polling."""
     filename = Path(filename).name
     acsm_path = UPLOAD_DIR / filename
 
@@ -308,7 +291,6 @@ def start_convert(filename):
 @app.route("/job-status/<job_id>")
 @login_required
 def job_status(job_id):
-    """Poll endpoint: returns current conversion progress."""
     if job_id not in active_jobs:
         return jsonify({"error": "Job not found"}), 404
 
@@ -329,7 +311,6 @@ def job_status(job_id):
 @app.route("/download/<filename>")
 @login_required
 def download(filename):
-    """Download a converted file (does NOT delete it)."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
@@ -340,7 +321,6 @@ def download(filename):
 @app.route("/delete/<filename>", methods=["POST"])
 @login_required
 def delete_file(filename):
-    """Delete a single file and its associated uploads/covers."""
     filename = Path(filename).name
     file_path = OUTPUT_DIR / filename
     if not file_path.exists():
@@ -366,7 +346,6 @@ def delete_file(filename):
 @app.route("/delete-all", methods=["POST"])
 @login_required
 def delete_all():
-    """Delete all converted files, uploads, and covers."""
     deleted = []
 
     for f in OUTPUT_DIR.iterdir():
@@ -398,7 +377,6 @@ def cover(filename):
 @app.route("/debug-status")
 @login_required
 def debug_status():
-    """Debug endpoint to check server state."""
     jobs_summary = {}
     for jid, job in active_jobs.items():
         jobs_summary[jid] = {
