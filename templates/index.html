@@ -177,6 +177,12 @@
                 <a href="/library">View Library</a>
                 <a href="/logout" style="margin-left:0.5rem">Logout</a>
             </div>
+            {% if user_picture %}
+            <div style="margin-top:1rem;display:flex;align-items:center;justify-content:center;gap:0.5rem">
+                <img src="{{ user_picture }}" style="width:28px;height:28px;border-radius:50%;border:2px solid rgba(255,255,255,0.3)" referrerpolicy="no-referrer">
+                <span style="color:#a0b4cc;font-size:0.85rem">{{ user_name }}</span>
+            </div>
+            {% endif %}
         </div>
     </header>
 
