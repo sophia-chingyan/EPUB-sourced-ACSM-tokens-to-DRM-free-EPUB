@@ -17,10 +17,12 @@ from flask import (
     request, send_from_directory, session, redirect, url_for,
 )
 
+from werkzeug.middleware.proxy_fix import ProxyFix
 from converter import convert_pipeline
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
